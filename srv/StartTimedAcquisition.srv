@@ -1,0 +1,4 @@
+int32 duration_minutes
+---
+bool success
+string message

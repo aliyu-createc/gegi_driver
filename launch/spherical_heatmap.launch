@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Spherical heatmap node with isotope identification.
+         Subscribes to /compton_event, publishes /sphere_heatmap, /source_direction, /source_isotopes. -->
+    <arg name="radius" default="0.5"/>
+    <arg name="n_points" default="2000"/>
+    <arg name="window_s" default="120.0"/>
+    <arg name="update_period_s" default="2.0"/>
+    <arg name="min_events" default="50"/>
+    <arg name="max_events" default="3000"/>
+    <arg name="hemisphere_only" default="true"/>
+
+    <node name="spherical_heatmap" pkg="phds_gegi_driver" type="spherical_heatmap_node.py" output="screen">
+        <param name="radius" type="double" value="$(arg radius)" />
+        <param name="n_points" type="int" value="$(arg n_points)" />
+        <param name="window_s" type="double" value="$(arg window_s)" />
+        <param name="update_period_s" type="double" value="$(arg update_period_s)" />
+        <param name="min_events" type="int" value="$(arg min_events)" />
+        <param name="max_events" type="int" value="$(arg max_events)" />
+        <param name="hemisphere_only" type="bool" value="$(arg hemisphere_only)" />
+    </node>
+</launch>

@@ -1,0 +1,30 @@
+# Build results
+**/Build/
+**/Release/
+
+
+# IDEs
+.cproject
+.idea/
+.project
+CMakeLists.txt.user
+
+# Docker
+.dockerignore
+docker-compose.yml
+
+# Python
+**/__pycache__/
+*.py[cod]
+
+# CMake
+
+**/CMakeCache.txt
+**/CMakeFiles
+**/CTestTestfile.cmake
+**/Makefile
+**/cmake_install.cmake
+**/install_manifest.txt
+
+# Mac
+**/.DS_Store

@@ -1,0 +1,108 @@
+ARG DEFAULT_WORKING_DIRECTORY=/opt/phds_gegi_driver
+
+# First set up base image with all deps installed
+FROM osrf/ros:melodic-desktop AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-c"]
+USER root
+
+ARG DEFAULT_WORKING_DIRECTORY
+ENV WORKING_DIRECTORY=$DEFAULT_WORKING_DIRECTORY
+
+COPY ./setup/phds_gegi_driver ${WORKING_DIRECTORY}/scripts
+
+WORKDIR ${WORKING_DIRECTORY}/scripts
+
+RUN ./setup_dependencies.sh
+
+# Keep network-dependent apt installs in the reusable base stage so source code
+# changes do not force a fresh internet fetch during later rebuilds.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip \
+        python3-matplotlib \
+        python3-numpy \
+        ros-melodic-rosbag \
+        ros-melodic-rosbridge-server \
+        ros-melodic-rosbridge-suite \
+    && rm -rf /var/lib/apt/lists/*
+
+# Do the build in a sacrificial temp image
+FROM base AS intermediate
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-c"]
+USER root
+
+ARG DEFAULT_WORKING_DIRECTORY
+ENV WORKING_DIRECTORY=$DEFAULT_WORKING_DIRECTORY
+
+COPY ./deps/radiation_detector_msgs ${WORKING_DIRECTORY}/src/radiation_detector_msgs
+COPY ./compton_localization ${WORKING_DIRECTORY}/src/compton_localization
+COPY ./createc-ros_compton_camera_reconstruction ${WORKING_DIRECTORY}/src/compton_camera_reconstruction
+COPY . ${WORKING_DIRECTORY}/src/phds_gegi_driver
+
+WORKDIR ${WORKING_DIRECTORY}
+
+RUN source /opt/ros/melodic/setup.bash && catkin_make clean && catkin_make
+
+#Remove the source & include directories and .git folders that remain
+RUN find ${WORKING_DIRECTORY}/src/phds_gegi_driver -type d -and -name src -exec rm -rv {} \; || true
+RUN find ${WORKING_DIRECTORY}/src/phds_gegi_driver -type d -and -name include -exec rm -rv {} \; || true
+RUN find ${WORKING_DIRECTORY}/src/phds_gegi_driver -type d -and -name '.git' -exec rm -rv {} \; || true
+
+#for debugging
+COPY --chown=root:root ./docker/entrypoints/phds_gegi_entrypoint.sh /phds_gegi_entrypoint.sh
+RUN sed -i 's/\r$//' /phds_gegi_entrypoint.sh && chmod +x /phds_gegi_entrypoint.sh
+ENTRYPOINT ["/phds_gegi_entrypoint.sh"]
+
+#=============================================
+
+#The real output, copy the build output
+FROM base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-c"]
+
+ARG DEFAULT_WORKING_DIRECTORY
+ENV WORKING_DIRECTORY=$DEFAULT_WORKING_DIRECTORY
+
+LABEL maintainer="michael.friedman"
+LABEL contact=michael.friedman@createc.co.uk
+LABEL description="Createc PHDS GeGi driver node"
+LABEL example_usage="docker run --network=host --env ROS_MASTER_URI=http://localhost:11311 -it phds_gegi bash --- then --- roslaunch phds_gegi_driver gegi_driver.launch in container"
+
+#Copy built stuffs
+COPY --from=intermediate ${WORKING_DIRECTORY} ${WORKING_DIRECTORY}
+
+WORKDIR ${WORKING_DIRECTORY}
+
+#Copy entrypoint (cribbed from ROS' docker version)
+COPY --chown=root:root ./docker/entrypoints/phds_gegi_entrypoint.sh /phds_gegi_entrypoint.sh
+RUN sed -i 's/\r$//' /phds_gegi_entrypoint.sh && chmod +x /phds_gegi_entrypoint.sh
+
+# Copy data collection / analysis scripts
+COPY capture.py     /opt/gegi_tools/capture.py
+COPY analyse_bag.py /opt/gegi_tools/analyse_bag.py
+COPY grab_sphere.py /opt/gegi_tools/grab_sphere.py
+COPY grab_spectrum.py /opt/gegi_tools/grab_spectrum.py
+COPY src/phds_gegi_driver/spherical_heatmap_node.py /opt/gegi_tools/spherical_heatmap_node.py
+RUN chmod +x /opt/gegi_tools/capture.py /opt/gegi_tools/analyse_bag.py \
+    /opt/gegi_tools/grab_sphere.py /opt/gegi_tools/grab_spectrum.py \
+    /opt/gegi_tools/spherical_heatmap_node.py && \
+    sed -i 's/\r$//' /opt/gegi_tools/*.py
+
+# Ensure rosrun/roslaunch can find the spherical heatmap node
+RUN mkdir -p ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver && \
+    cp /opt/gegi_tools/spherical_heatmap_node.py ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/spherical_heatmap_node.py && \
+    sed -i 's/\r$//' ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/spherical_heatmap_node.py && \
+    chmod +x ${WORKING_DIRECTORY}/devel/lib/phds_gegi_driver/spherical_heatmap_node.py
+
+# Bag output mountpoint — map this to a host path when running
+RUN mkdir -p /bags
+VOLUME /bags
+
+ENTRYPOINT ["/phds_gegi_entrypoint.sh"]

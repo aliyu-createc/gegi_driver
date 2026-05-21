@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Full GeGI pipeline: driver + spectrum + spherical heatmap -->
+    <arg name="gegi_ip" default="192.168.50.109"/>
+    <arg name="gegi_port" default="27015"/>
+
+    <!-- GeGI control driver -->
+    <include file="$(find phds_gegi_driver)/launch/gegi_driver.launch">
+        <arg name="gegi_ip" value="$(arg gegi_ip)"/>
+        <arg name="gegi_port" value="$(arg gegi_port)"/>
+    </include>
+
+    <!-- Spectrum accumulator -->
+    <include file="$(find phds_gegi_driver)/launch/spectrum.launch"/>
+
+    <!-- Spherical heatmap with isotope ID -->
+    <include file="$(find phds_gegi_driver)/launch/spherical_heatmap.launch"/>
+</launch>

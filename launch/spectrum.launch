@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Standalone spectrum node. Subscribes to /energy_deposit, publishes /spectrum. -->
+    <arg name="calibration_file" default="$(find phds_gegi_driver)/config/EnergyCal.csv"/>
+    <arg name="publish_rate_hz" default="4.0"/>
+    <arg name="energy_topic" default="/energy_deposit"/>
+    <arg name="spectrum_topic" default="/spectrum"/>
+
+    <node name="spectrum" pkg="phds_gegi_driver" type="spectrum_node.py" output="screen">
+        <param name="calibration_file" value="$(arg calibration_file)" />
+        <param name="publish_rate_hz" type="double" value="$(arg publish_rate_hz)" />
+        <param name="energy_topic" value="$(arg energy_topic)" />
+        <param name="spectrum_topic" value="$(arg spectrum_topic)" />
+        <param name="detector_frame" value="detector" />
+    </node>
+</launch>
