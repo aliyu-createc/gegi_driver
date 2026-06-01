@@ -36,6 +36,8 @@ namespace phds_gegi_driver {
 
         void publishEnergy(double energy_kev);
 
+        void publishSinglesEnergy(double energy_kev);
+
         // Remote control service callbacks
         bool handleStartAcquisition(phds_gegi_driver::StartAcquisition::Request &req,
                                     phds_gegi_driver::StartAcquisition::Response &res);
@@ -58,6 +60,7 @@ namespace phds_gegi_driver {
 
         ros::Publisher event_publisher_;
         ros::Publisher energy_publisher_;
+        ros::Publisher singles_energy_publisher_;
 
         // Remote control service servers
         ros::ServiceServer start_acq_service_;

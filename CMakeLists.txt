@@ -62,6 +62,8 @@ target_link_libraries(${PROJECT_NAME}_node ${PROJECT_NAME} ${catkin_LIBRARIES})
 catkin_install_python(PROGRAMS
   src/phds_gegi_driver/spectrum_node.py
   src/phds_gegi_driver/spherical_heatmap_node.py
+  src/phds_gegi_driver/activity_node.py
+  src/phds_gegi_driver/data_recorder_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

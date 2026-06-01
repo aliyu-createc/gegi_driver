@@ -10,6 +10,7 @@ This avoids depth ambiguity by only estimating source direction.
 """
 from __future__ import print_function
 
+import json
 import threading
 from collections import deque
 
@@ -27,6 +28,12 @@ from std_msgs.msg import String
 ISOTOPE_PEAKS = {
     'Cs-137': {'energy': 662, 'window': 80},
     'Co-60':  {'energy': 1252, 'window': 200},  # avg of 1173+1332, wide window covers both
+}
+
+# Specific gamma-ray dose rate constants (uSv*m^2 / MBq*h)
+GAMMA_CONSTANTS = {
+    'Cs-137': 0.0771,
+    'Co-60':  0.3059,
 }
 
 
@@ -64,17 +71,18 @@ def fibonacci_sphere(n_points):
 class SphericalHeatmapNode(object):
     def __init__(self):
         self.radius = rospy.get_param("~radius", 0.5)  # 1m diameter
-        self.n_points = int(rospy.get_param("~n_points", 2000))
+        self.n_points = int(rospy.get_param("~n_points", 8000))
         self.window_s = rospy.get_param("~window_s", 120.0)
         self.update_period_s = rospy.get_param("~update_period_s", 2.0)
         self.min_events = int(rospy.get_param("~min_events", 50))
         self.max_events = int(rospy.get_param("~max_events", 3000))
-        self.sigma_floor = rospy.get_param("~sigma_floor", 0.20)
-        self.max_uncertainty = rospy.get_param("~max_uncertainty", 0.20)
+        self.sigma_floor = rospy.get_param("~sigma_floor", 0.12)
+        self.max_uncertainty = rospy.get_param("~max_uncertainty", 0.15)
         self.hemisphere_only = rospy.get_param("~hemisphere_only", True)
         self.max_peaks = int(rospy.get_param("~max_peaks", 5))
-        self.peak_min_separation_deg = rospy.get_param("~peak_min_separation_deg", 20.0)
-        self.peak_threshold = rospy.get_param("~peak_threshold", 0.5)  # fraction of max score
+        self.peak_min_separation_deg = rospy.get_param("~peak_min_separation_deg", 15.0)
+        self.peak_threshold = rospy.get_param("~peak_threshold", 0.4)  # fraction of max score
+        self.refine_peaks = rospy.get_param("~refine_peaks", True)
 
         # Build sphere grid
         all_pts = fibonacci_sphere(self.n_points * (1 if not self.hemisphere_only else 2))
@@ -97,6 +105,11 @@ class SphericalHeatmapNode(object):
 
         self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
 
+        # Subscribe to activity results for absolute dose rate scaling
+        self._dose_rate_uSv_h = {}  # isotope display name -> dose rate in uSv/h
+        self.sub_activity = rospy.Subscriber(
+            "/activity/results", String, self._on_activity, queue_size=5)
+
         self.timer = rospy.Timer(rospy.Duration(self.update_period_s), self.on_timer)
 
     def _handle_clear(self, req):
@@ -105,6 +118,35 @@ class SphericalHeatmapNode(object):
             self.events.clear()
         rospy.loginfo("Cleared %d events from sphere heatmap buffer", n)
         return TriggerResponse(success=True, message="Cleared {} events".format(n))
+
+    def _on_activity(self, msg):
+        """Parse activity results and compute dose rate per isotope."""
+        try:
+            data = json.loads(msg.data)
+            d = self.radius  # source distance = sphere radius
+            dose_rates = {}
+            activities = {}
+            for iso in data.get('isotopes', []):
+                name = iso.get('isotope', '')
+                activity_mbq = iso.get('activity_MBq', 0.0)
+                if 'Cs137' in name:
+                    display = 'Cs-137'
+                elif 'Co60' in name:
+                    display = 'Co-60'
+                else:
+                    display = name
+                # For Co-60 take max of two peaks (same source activity)
+                if display in activities:
+                    activities[display] = max(activities[display], activity_mbq)
+                else:
+                    activities[display] = activity_mbq
+            for display, a_mbq in activities.items():
+                gamma = GAMMA_CONSTANTS.get(display, 0.077)
+                dose_rates[display] = gamma * a_mbq / (d * d) if d > 0 else 0.0
+            with self.lock:
+                self._dose_rate_uSv_h = dose_rates
+        except (ValueError, TypeError):
+            pass
 
     def on_event(self, msg):
         if msg.cone_angle_uncertainty <= 0.0 or msg.cone_angle_uncertainty > self.max_uncertainty:
@@ -142,7 +184,7 @@ class SphericalHeatmapNode(object):
             cos_actual = np.clip(cos_actual, -1.0, 1.0)
             actual_angle = np.arccos(cos_actual)
             ang_dev = np.abs(actual_angle - angle)
-            scores += -0.5 * (ang_dev / self.sigma_floor) ** 2
+            scores += np.exp(-0.5 * (ang_dev / self.sigma_floor) ** 2)
 
         return scores
 
@@ -161,7 +203,7 @@ class SphericalHeatmapNode(object):
             cos_actual = np.clip(cos_actual, -1.0, 1.0)
             actual_angle = np.arccos(cos_actual)
             ang_dev = np.abs(actual_angle - angle)
-            scores += -0.5 * (ang_dev / self.sigma_floor) ** 2
+            scores += np.exp(-0.5 * (ang_dev / self.sigma_floor) ** 2)
             count += 1
 
         return scores, count
@@ -273,6 +315,42 @@ class SphericalHeatmapNode(object):
 
         return peaks
 
+    def _refine_peak_centroid(self, peak_idx, scores, radius_rad=0.06):
+        """Refine peak location using score-weighted centroid of nearby points.
+
+        Instead of just taking the grid point with the highest score, compute
+        a weighted average direction using all points within radius_rad.
+        Uses a tight radius (0.06 rad ~ 3.4 deg) and high weighting exponent
+        to avoid bias from neighboring sources.
+        """
+        center_dir = self.directions[peak_idx]
+        cos_angles = self.directions.dot(center_dir)
+        neighbors = np.where(cos_angles > np.cos(radius_rad))[0]
+
+        if len(neighbors) < 3:
+            return self.sphere_points[peak_idx]
+
+        # Use scores raised to a power to sharpen the weighting
+        neighbor_scores = scores[neighbors]
+        # Shift so minimum in neighborhood is 0
+        shifted = neighbor_scores - neighbor_scores.min()
+        max_shifted = shifted.max()
+        if max_shifted < 1e-12:
+            return self.sphere_points[peak_idx]
+
+        # Cube the weights for very sharp centroid (minimize pull from neighbors)
+        weights = (shifted / max_shifted) ** 3
+
+        # Weighted average of unit direction vectors
+        weighted_dirs = self.directions[neighbors] * weights[:, np.newaxis]
+        centroid_dir = weighted_dirs.sum(axis=0)
+        norm = np.linalg.norm(centroid_dir)
+        if norm < 1e-9:
+            return self.sphere_points[peak_idx]
+
+        centroid_dir /= norm
+        return centroid_dir * self.radius
+
     def on_timer(self, _event):
         now = rospy.Time.now()
         with self.lock:
@@ -312,47 +390,53 @@ class SphericalHeatmapNode(object):
         peaks_msg.header.stamp = now
         peaks_msg.header.frame_id = "detector"
         isotope_labels = []
-        used_directions = []  # track published peak directions to avoid duplicates
 
         for iso_name, iso_info in ISOTOPE_PEAKS.items():
             iso_scores, iso_count = self._solve_energy_filtered(
                 events, iso_info['energy'], iso_info['window'])
-            if iso_count < 10:
+            if iso_count < 5:
                 continue
             iso_peaks = self._find_peaks(iso_scores)
             if not iso_peaks:
                 continue
             # Take only the strongest peak for this isotope
             pidx = iso_peaks[0]
-            direction = self.directions[pidx]
-            # Check it's not too close to an already-published peak
-            too_close = False
-            min_sep_rad = np.radians(self.peak_min_separation_deg)
-            for prev_dir in used_directions:
-                cos_sep = np.dot(direction, prev_dir)
-                cos_sep = np.clip(cos_sep, -1.0, 1.0)
-                if np.arccos(cos_sep) < min_sep_rad:
-                    too_close = True
-                    break
-            if too_close:
-                continue
+            # Refine peak location using score-weighted centroid
+            if self.refine_peaks:
+                refined_pos = self._refine_peak_centroid(pidx, iso_scores)
+            else:
+                refined_pos = self.sphere_points[pidx]
+            # Convert sphere position to real-world coordinate at source plane
+            # Y_real = distance * Y_sphere / X_sphere (ray-plane intersection)
+            x_s = float(refined_pos[0])
+            y_s = float(refined_pos[1])
+            z_s = float(refined_pos[2])
+            if abs(x_s) > 1e-6:
+                y_real = self.radius * y_s / x_s
+                z_real = self.radius * z_s / x_s
+            else:
+                y_real = y_s
+                z_real = z_s
             p = Pose()
-            p.position.x = float(self.sphere_points[pidx, 0])
-            p.position.y = float(self.sphere_points[pidx, 1])
-            p.position.z = float(self.sphere_points[pidx, 2])
+            p.position.x = self.radius  # source distance along X
+            p.position.y = y_real
+            p.position.z = z_real
             p.orientation.w = 1.0
             peaks_msg.poses.append(p)
-            isotope_labels.append(iso_name)
-            used_directions.append(direction)
+            # Include event count so plotter can scale by activity
+            isotope_labels.append("{}:{}".format(iso_name, iso_count))
 
         self.pub_peaks.publish(peaks_msg)
 
-        # Publish isotope identification
+        # Publish isotope identification with counts
         iso_msg = String()
         iso_msg.data = "|".join(isotope_labels) if isotope_labels else "none"
         self.pub_isotopes.publish(iso_msg)
 
-        # Publish PointCloud2 with per-isotope scores
+        # Publish PointCloud2 with per-isotope scores scaled to dose rate (uSv/h)
+        with self.lock:
+            dose_rates = dict(self._dose_rate_uSv_h)
+
         iso_norm_scores = {}
         for iso_name, iso_info in ISOTOPE_PEAKS.items():
             iso_scores, iso_count = self._solve_energy_filtered(
@@ -361,22 +445,42 @@ class SphericalHeatmapNode(object):
                 iso_min = iso_scores.min()
                 iso_max = iso_scores.max()
                 if iso_max - iso_min > 1e-12:
-                    iso_norm_scores[iso_name] = (iso_scores - iso_min) / (iso_max - iso_min)
+                    normed = (iso_scores - iso_min) / (iso_max - iso_min)
                 else:
-                    iso_norm_scores[iso_name] = np.zeros_like(iso_scores)
+                    normed = np.zeros_like(iso_scores)
+                # Scale peak to actual dose rate (uSv/h) from activity measurement
+                dr = dose_rates.get(iso_name, 0.0)
+                if dr > 0:
+                    iso_norm_scores[iso_name] = normed * dr
+                else:
+                    # Fallback: use gamma constant as relative weight
+                    gamma = GAMMA_CONSTANTS.get(iso_name, 0.077)
+                    iso_norm_scores[iso_name] = normed * gamma
             else:
                 iso_norm_scores[iso_name] = np.zeros_like(scores)
+
+        # Combine per-isotope scores (take max at each point)
+        # Do NOT renormalize - values represent dose rate in uSv/h
+        combined = np.zeros_like(scores)
+        for v in iso_norm_scores.values():
+            combined = np.maximum(combined, v)
+        norm_scores = combined
 
         self._publish_cloud(now, norm_scores, iso_norm_scores)
 
         rospy.loginfo_throttle(5.0,
-                               "sphere heatmap: %d events, %d sources [%s], strongest (%.2f, %.2f, %.2f)",
+                               "sphere heatmap: %d events, %d sources [%s], peak dose=%.3f uSv/h, dose_rates=%s",
                                len(events), len(peaks_msg.poses),
                                iso_msg.data,
-                               peak_dir[0], peak_dir[1], peak_dir[2])
+                               float(norm_scores.max()),
+                               dose_rates)
 
     def _publish_cloud(self, stamp, norm_scores, iso_norm_scores):
-        """Publish colored PointCloud2 with per-isotope intensity fields."""
+        """Publish colored PointCloud2 with per-isotope intensity fields.
+        
+        The intensity field contains dose rate in uSv/h.
+        RGB is normalized for visual coloring only.
+        """
         points = self.sphere_points
         n = points.shape[0]
 
@@ -395,19 +499,31 @@ class SphericalHeatmapNode(object):
         cs137_scores = iso_norm_scores.get('Cs-137', np.zeros(n))
         co60_scores = iso_norm_scores.get('Co-60', np.zeros(n))
 
+        # Normalize scores to [0,1] for RGB coloring only
+        vmax = norm_scores.max()
+        if vmax > 1e-12:
+            # Suppress background noise: zero out below 10% of peak
+            threshold = vmax * 0.10
+            suppressed = np.where(norm_scores >= threshold, norm_scores, 0.0)
+            color_scores = suppressed / vmax
+        else:
+            color_scores = np.zeros_like(norm_scores)
+
         buf = bytearray(n * point_step)
         for i in range(n):
             struct.pack_into('fff', buf, i * point_step, points[i, 0], points[i, 1], points[i, 2])
-            # Color: blue (cold) -> red (hot)
-            v = norm_scores[i]
+            # Color: blue (cold) -> red (hot) using normalized values
+            v = color_scores[i]
             r = int(min(255, v * 2 * 255))
             g = int(min(255, max(0, (v - 0.25) * 2) * 255)) if v > 0.25 else 0
-            b = int(max(0, (1.0 - v * 2) * 255))
+            b = int(max(0, (1.0 - v * 2) * 255)) if v < 0.5 else 0
             rgb_int = (r << 16) | (g << 8) | b
             struct.pack_into('f', buf, i * point_step + 12, struct.unpack('f', struct.pack('I', rgb_int))[0])
-            struct.pack_into('f', buf, i * point_step + 16, v)
-            struct.pack_into('f', buf, i * point_step + 20, cs137_scores[i])
-            struct.pack_into('f', buf, i * point_step + 24, co60_scores[i])
+            # Intensity field: dose rate, zeroed for background points
+            intensity = norm_scores[i] if color_scores[i] > 0 else 0.0
+            struct.pack_into('f', buf, i * point_step + 16, intensity)
+            struct.pack_into('f', buf, i * point_step + 20, cs137_scores[i] if color_scores[i] > 0 else 0.0)
+            struct.pack_into('f', buf, i * point_step + 24, co60_scores[i] if color_scores[i] > 0 else 0.0)
 
         msg = PointCloud2()
         msg.header = Header(stamp=stamp, frame_id="detector")

@@ -89,20 +89,22 @@ Notes:
 ### 2) Run the full pipeline container
 
 ```powershell
-docker run --rm --network host --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_full_pipeline.launch"
+docker run --rm -d -p 9090:9090 --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_full_pipeline.launch"
 ```
 
 What it does:
 
-- Starts a container named `gegi_live`.
-- Uses host networking so ROS and detector traffic are directly reachable.
+- Starts a container named `gegi_live` in detached mode.
+- Publishes the rosbridge websocket on port 9090 so Windows-side plotting tools can connect.
 - Sources ROS + workspace setup files.
 - Launches driver + spectrum + spherical heatmap + rosbridge via `gegi_full_pipeline.launch`.
+
+> **Note:** Do not use `--network host` on Docker Desktop for Windows — it does not actually expose container ports to the host. Use `-p` port mappings instead.
 
 If you only want the detector driver (without spectrum/heatmap), use:
 
 ```powershell
-docker run --rm --network host --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_driver.launch"
+docker run --rm -d -p 9090:9090 --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_driver.launch"
 ```
 
 ## Monitoring Topics

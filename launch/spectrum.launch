@@ -5,8 +5,9 @@
     <arg name="publish_rate_hz" default="4.0"/>
     <arg name="energy_topic" default="/energy_deposit"/>
     <arg name="spectrum_topic" default="/spectrum"/>
+    <arg name="node_name" default="spectrum"/>
 
-    <node name="spectrum" pkg="phds_gegi_driver" type="spectrum_node.py" output="screen">
+    <node name="$(arg node_name)" pkg="phds_gegi_driver" type="spectrum_node.py" output="screen">
         <param name="calibration_file" value="$(arg calibration_file)" />
         <param name="publish_rate_hz" type="double" value="$(arg publish_rate_hz)" />
         <param name="energy_topic" value="$(arg energy_topic)" />

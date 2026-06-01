@@ -10,9 +10,25 @@
         <arg name="gegi_port" value="$(arg gegi_port)"/>
     </include>
 
-    <!-- Spectrum accumulator -->
+    <!-- Spectrum accumulator (all events) -->
     <include file="$(find phds_gegi_driver)/launch/spectrum.launch"/>
+
+    <!-- Spectrum accumulator (singles only - photoelectric events) -->
+    <include file="$(find phds_gegi_driver)/launch/spectrum.launch">
+        <arg name="energy_topic" value="/energy_deposit_singles"/>
+        <arg name="spectrum_topic" value="/spectrum_singles"/>
+        <arg name="node_name" value="spectrum_singles"/>
+    </include>
 
     <!-- Spherical heatmap with isotope ID -->
     <include file="$(find phds_gegi_driver)/launch/spherical_heatmap.launch"/>
+
+    <!-- Activity computation (net peak area and Bq per isotope) -->
+    <include file="$(find phds_gegi_driver)/launch/activity.launch"/>
+
+    <!-- Data recorder (saves .bag, .n42, .csv at end of timed acquisition) -->
+    <include file="$(find phds_gegi_driver)/launch/data_recorder.launch"/>
+
+    <!-- Rosbridge websocket server for Windows-side plotting tools -->
+    <include file="$(find rosbridge_server)/launch/rosbridge_websocket.launch"/>
 </launch>

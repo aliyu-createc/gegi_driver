@@ -1,0 +1,60 @@
+# Isotope configuration for activity calculation.
+# ROI and sideband energies are in keV.
+# calibration_factor units: Bq per net count per second (set after efficiency calibration).
+# If calibration_factor is null/0, activity is computed from first principles:
+#   A = N_net / (eps_intrinsic * Omega/(4pi) * I_gamma * t_live)
+
+# Specific gamma-ray dose rate constants (uSv*m^2 / MBq*h)
+# Used to convert measured activity to ambient dose rate.
+gamma_constants:
+  Cs137: 0.0771
+  Co60: 0.3059
+
+# Counting window: how many seconds of spectra to accumulate before computing activity.
+counting_window_s: 60.0
+
+# Minimum net counts required for a valid activity estimate (per philosophy doc: 400)
+min_net_counts: 400
+
+# Geometric solid angle fraction: Omega / (4*pi)
+# For a point source at distance d from a circular crystal of radius r:
+#   solid_angle_fraction = 0.5 * (1 - d / sqrt(d^2 + r^2))
+# GeGI crystal: 90-mm diameter (r = 0.045 m), 11-mm thick, active area 61 cm2.
+# At d = 0.5 m: 0.5*(1 - 0.5/sqrt(0.25+0.002025)) = 0.00202
+solid_angle_fraction: 0.00202
+
+isotopes:
+  Cs137:
+    energy_keV: 661.7
+    emission_probability: 0.851
+    peak_roi_keV: [655.0, 669.0]
+    left_sideband_keV: [620.0, 645.0]
+    right_sideband_keV: [680.0, 705.0]
+    # Empirical calibration factor (Bq/cps) at 0.5m, 28-May-2026
+    # True activity 3.092 MBq / 67.70 cps = 45672 Bq/cps
+    calibration_factor: 45672.0
+    efficiency: 0.0
+
+  Co60_1173:
+    energy_keV: 1173.2
+    emission_probability: 0.9985
+    peak_roi_keV: [1165.0, 1181.0]
+    left_sideband_keV: [1140.0, 1158.0]
+    right_sideband_keV: [1190.0, 1208.0]
+    # Empirical calibration factor (Bq/cps) at 0.5m, 28-May-2026
+    # True activity 1.826 MBq / 15.51 cps = 117730 Bq/cps
+    calibration_factor: 117730.0
+    efficiency: 0.0
+
+  Co60_1332:
+    energy_keV: 1332.5
+    emission_probability: 0.9998
+    peak_roi_keV: [1325.0, 1340.0]
+    left_sideband_keV: [1300.0, 1318.0]
+    right_sideband_keV: [1348.0, 1366.0]
+    # Empirical calibration factor (Bq/cps) at 0.5m, 28-May-2026
+    # True activity 1.826 MBq / 11.18 cps = 163393 Bq/cps
+    calibration_factor: 163393.0
+    efficiency: 0.0
+
+

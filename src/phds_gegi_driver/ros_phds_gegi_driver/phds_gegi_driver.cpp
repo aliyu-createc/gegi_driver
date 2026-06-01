@@ -29,16 +29,19 @@ namespace phds_gegi_driver {
         std::string gegi_port = "27015";
         std::string event_topic = "/compton_event";
         std::string energy_topic = "/energy_deposit";
+        std::string singles_energy_topic = "/energy_deposit_singles";
 
         getParam(pn, "gegi_ip", gegi_ip);
         getParam(pn, "gegi_port", gegi_port);
         getParam(pn, "event_topic", event_topic);
         getParam(pn, "energy_topic", energy_topic);
+        getParam(pn, "singles_energy_topic", singles_energy_topic);
         getParam(pn, "detector_frame", detector_frame_);
 
         constexpr static int OUTPUT_BUFFER_SIZE = 100;
         event_publisher_ = n.advertise<radiation_detector_msgs::ComptonEvent>(event_topic, OUTPUT_BUFFER_SIZE);
         energy_publisher_ = n.advertise<std_msgs::Float64>(energy_topic, OUTPUT_BUFFER_SIZE);
+        singles_energy_publisher_ = n.advertise<std_msgs::Float64>(singles_energy_topic, OUTPUT_BUFFER_SIZE);
 
         try {
             tcp_event_reader_.connect(gegi_ip, gegi_port);
@@ -69,7 +72,9 @@ namespace phds_gegi_driver {
     }
 
     void PhdsGegiDriver::process1SiteEvent(const compton_events::Event1Site &event) {
-        publishEnergy(event.compton_interaction.avg_energy);
+        double energy = event.compton_interaction.avg_energy;
+        publishEnergy(energy);
+        publishSinglesEnergy(energy);
     }
 
     void PhdsGegiDriver::process2SiteEvent(const compton_events::Event2Site &event) {
@@ -109,6 +114,12 @@ namespace phds_gegi_driver {
         std_msgs::Float64 msg;
         msg.data = energy_kev;
         energy_publisher_.publish(msg);
+    }
+
+    void PhdsGegiDriver::publishSinglesEnergy(double energy_kev) {
+        std_msgs::Float64 msg;
+        msg.data = energy_kev;
+        singles_energy_publisher_.publish(msg);
     }
 
     bool PhdsGegiDriver::handleStartAcquisition(phds_gegi_driver::StartAcquisition::Request &req,
