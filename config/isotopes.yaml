@@ -1,8 +1,17 @@
 # Isotope configuration for activity calculation.
 # ROI and sideband energies are in keV.
-# calibration_factor units: Bq per net count per second (set after efficiency calibration).
-# If calibration_factor is null/0, activity is computed from first principles:
-#   A = N_net / (eps_intrinsic * Omega/(4pi) * I_gamma * t_live)
+#
+# Geometry-independent activity measurement:
+#   The calibration_factor (Bq/cps, measured at calibration_distance_m) is used to
+#   DERIVE the detector's true intrinsic efficiency:
+#     eps_intrinsic = 1 / (CF * solid_angle(cal_dist) * I_gamma)
+#   This intrinsic efficiency is a detector constant — it never changes.
+#   At any source distance d, activity is then:
+#     A = N_net / (eps_intrinsic * solid_angle(d) * I_gamma * t_live)
+#
+#   To use: set source_distance_m to the actual source distance. The node
+#   auto-computes solid angle and gives correct activity at ANY distance.
+#   Distance can be updated at runtime via the ~/source_distance topic.
 
 # Specific gamma-ray dose rate constants (uSv*m^2 / MBq*h)
 # Used to convert measured activity to ambient dose rate.
@@ -16,11 +25,21 @@ counting_window_s: 60.0
 # Minimum net counts required for a valid activity estimate (per philosophy doc: 400)
 min_net_counts: 400
 
+# Source distance in metres. When set (> 0), the node auto-computes the
+# solid angle fraction and applies a distance correction to calibration factors.
+# This makes measured activity distance-independent.
+# Set to 0 to disable (uses raw calibration factor assuming calibration geometry).
+source_distance_m: 0.42
+
+# Distance at which the empirical calibration factors were measured.
+calibration_distance_m: 0.5
+
 # Geometric solid angle fraction: Omega / (4*pi)
 # For a point source at distance d from a circular crystal of radius r:
 #   solid_angle_fraction = 0.5 * (1 - d / sqrt(d^2 + r^2))
 # GeGI crystal: 90-mm diameter (r = 0.045 m), 11-mm thick, active area 61 cm2.
 # At d = 0.5 m: 0.5*(1 - 0.5/sqrt(0.25+0.002025)) = 0.00202
+# NOTE: If source_distance_m is set, solid_angle_fraction is auto-computed.
 solid_angle_fraction: 0.00202
 
 isotopes:
@@ -30,8 +49,9 @@ isotopes:
     peak_roi_keV: [655.0, 669.0]
     left_sideband_keV: [620.0, 645.0]
     right_sideband_keV: [680.0, 705.0]
-    # Empirical calibration factor (Bq/cps) at 0.5m, 28-May-2026
-    # True activity 3.092 MBq / 67.70 cps = 45672 Bq/cps
+    # Empirical calibration factor (Bq/cps) measured at calibration_distance_m (0.5m).
+    # Used to DERIVE geometry-independent intrinsic efficiency:
+    #   eps_intrinsic = 1 / (CF * omega_cal * I_gamma) = 0.012783
     calibration_factor: 45672.0
     efficiency: 0.0
 
@@ -41,8 +61,7 @@ isotopes:
     peak_roi_keV: [1165.0, 1181.0]
     left_sideband_keV: [1140.0, 1158.0]
     right_sideband_keV: [1190.0, 1208.0]
-    # Empirical calibration factor (Bq/cps) at 0.5m, 28-May-2026
-    # True activity 1.826 MBq / 15.51 cps = 117730 Bq/cps
+    # Empirical CF at 0.5m -> eps_intrinsic = 0.004226
     calibration_factor: 117730.0
     efficiency: 0.0
 
@@ -52,8 +71,7 @@ isotopes:
     peak_roi_keV: [1325.0, 1340.0]
     left_sideband_keV: [1300.0, 1318.0]
     right_sideband_keV: [1348.0, 1366.0]
-    # Empirical calibration factor (Bq/cps) at 0.5m, 28-May-2026
-    # True activity 1.826 MBq / 11.18 cps = 163393 Bq/cps
+    # Empirical CF at 0.5m -> eps_intrinsic = 0.003041
     calibration_factor: 163393.0
     efficiency: 0.0
 

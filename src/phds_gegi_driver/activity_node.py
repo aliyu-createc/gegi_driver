@@ -24,6 +24,12 @@ Parameters:
   ~counting_window_s (float): Override counting window (default from config).
   ~spectrum_topic (str): Input topic (default: /spectrum).
   ~publish_on_window (bool): Publish only when window completes (default: true).
+  ~source_distance_m (float): Source-detector distance in metres. When > 0,
+      computes solid angle for absolute activity. Updated dynamically via
+      ~/source_distance topic (std_msgs/Float64, in metres).
+  ~calibration_distance_m (float): Distance at which empirical calibration
+      factors were measured (default: 0.5 m). Only used if calibration_factor
+      fallback is active.
 """
 from __future__ import print_function
 
@@ -46,6 +52,23 @@ from radiation_detector_msgs.msg import Spectrum
 GEGI_EFFICIENCY_COEFFS = [-1.7696, -9.4708, 18.7567, -11.7681, 3.0472, -0.2854]
 
 
+# GeGI crystal radius in metres (90 mm diameter)
+GEGI_CRYSTAL_RADIUS_M = 0.045
+
+
+def gegi_solid_angle_fraction(distance_m, crystal_radius_m=GEGI_CRYSTAL_RADIUS_M):
+    """Compute geometric solid angle fraction Omega/(4*pi) for a point source
+    at distance d from a circular detector of radius r.
+
+    Formula: 0.5 * (1 - d / sqrt(d^2 + r^2))
+    """
+    if distance_m <= 0:
+        return 0.0
+    d2 = distance_m * distance_m
+    r2 = crystal_radius_m * crystal_radius_m
+    return 0.5 * (1.0 - distance_m / math.sqrt(d2 + r2))
+
+
 def gegi_intrinsic_efficiency(energy_keV):
     """Compute GeGI intrinsic FEP efficiency at a given energy (keV).
 
@@ -62,15 +85,32 @@ def gegi_intrinsic_efficiency(energy_keV):
 class IsotopeConfig(object):
     """Holds ROI channel indices and calibration data for one isotope."""
 
-    def __init__(self, name, cfg, bin_edges):
+    def __init__(self, name, cfg, bin_edges, calibration_distance_m=0.5):
         self.name = name
         self.energy_keV = cfg['energy_keV']
         self.emission_probability = cfg['emission_probability']
         self.calibration_factor = cfg.get('calibration_factor', 0.0) or 0.0
         self.efficiency = cfg.get('efficiency', 0.0) or 0.0
 
-        # Compute intrinsic efficiency from PHDS polynomial
-        self.intrinsic_efficiency = gegi_intrinsic_efficiency(self.energy_keV)
+        # Intrinsic efficiency: the geometry-independent detector constant.
+        # Priority:
+        #   1) Explicitly provided measured_intrinsic_efficiency (from prior calibration)
+        #   2) Derived from calibration_factor + calibration_distance (auto-computed)
+        #   3) PHDS polynomial estimate (theoretical, less accurate)
+        measured = cfg.get('measured_intrinsic_efficiency', 0.0) or 0.0
+        if measured > 0:
+            self.intrinsic_efficiency = measured
+        elif self.calibration_factor > 0 and calibration_distance_m > 0:
+            # Derive from empirical calibration: eps = 1/(CF * omega_cal * I_gamma)
+            omega_cal = gegi_solid_angle_fraction(calibration_distance_m)
+            if omega_cal > 0 and self.emission_probability > 0:
+                self.intrinsic_efficiency = 1.0 / (
+                    self.calibration_factor * omega_cal * self.emission_probability)
+            else:
+                self.intrinsic_efficiency = gegi_intrinsic_efficiency(self.energy_keV)
+        else:
+            # Fall back to PHDS polynomial (theoretical estimate)
+            self.intrinsic_efficiency = gegi_intrinsic_efficiency(self.energy_keV)
 
         # Convert energy ranges to channel indices
         self.peak_channels = self._energy_to_channels(cfg['peak_roi_keV'], bin_edges)
@@ -95,12 +135,14 @@ class ActivityNode(object):
         spectrum_topic = rospy.get_param("~spectrum_topic", "/spectrum")
         self.publish_on_window = rospy.get_param("~publish_on_window", True)
 
-        # Geometric solid angle fraction: Omega / (4*pi)
-        # Set from calibration: depends on source-detector distance and crystal area.
-        # For a point source at distance d from a circular detector of radius r:
-        #   Omega/(4pi) = 0.5 * (1 - d / sqrt(d^2 + r^2))
-        # This must be determined during efficiency calibration for the tray geometry.
-        self.solid_angle_fraction = rospy.get_param("~solid_angle_fraction", 0.0)
+        # Source distance in metres. Dynamically updatable via ~/source_distance topic.
+        # When > 0, the node uses first-principles (intrinsic efficiency + solid angle)
+        # for geometry-independent activity measurement.
+        self.source_distance_m = rospy.get_param("~source_distance_m", 0.0)
+        self.calibration_distance_m = rospy.get_param("~calibration_distance_m", 0.5)
+
+        # Compute initial solid angle from distance (updated dynamically)
+        self._update_solid_angle()
 
         # Load energy calibration
         self.bin_edges = self._load_energy_cal(cal_path)
@@ -112,7 +154,15 @@ class ActivityNode(object):
         self.counting_window_s = rospy.get_param(
             "~counting_window_s", iso_cfg.get('counting_window_s', 60.0))
         self.min_net_counts = iso_cfg.get('min_net_counts', 400)
-        # Allow solid_angle_fraction override from config file
+
+        # Allow source_distance_m from config file if not set via param
+        if self.source_distance_m <= 0:
+            self.source_distance_m = iso_cfg.get('source_distance_m', 0.0) or 0.0
+            self._update_solid_angle()
+        if self.calibration_distance_m <= 0:
+            self.calibration_distance_m = iso_cfg.get('calibration_distance_m', 0.5) or 0.5
+
+        # Fallback solid_angle_fraction from config (used only if distance not set)
         if self.solid_angle_fraction <= 0:
             self.solid_angle_fraction = iso_cfg.get('solid_angle_fraction', 0.0) or 0.0
 
@@ -120,11 +170,12 @@ class ActivityNode(object):
         self.isotopes = []
         for name, cfg in iso_cfg.get('isotopes', {}).items():
             try:
-                ic = IsotopeConfig(name, cfg, self.bin_edges)
+                ic = IsotopeConfig(name, cfg, self.bin_edges, self.calibration_distance_m)
                 self.isotopes.append(ic)
-                rospy.loginfo("  Isotope %s: peak channels %d-%d, E=%.1f keV",
+                rospy.loginfo("  Isotope %s: peak channels %d-%d, E=%.1f keV, "
+                              "eps_intrinsic=%.6f",
                               name, ic.peak_channels[0], ic.peak_channels[-1],
-                              ic.energy_keV)
+                              ic.energy_keV, ic.intrinsic_efficiency)
             except Exception as e:
                 rospy.logwarn("Failed to configure isotope %s: %s", name, str(e))
 
@@ -142,12 +193,18 @@ class ActivityNode(object):
         # Services
         self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
 
-        # Subscriber
+        # Subscribers
         self.sub = rospy.Subscriber(spectrum_topic, Spectrum,
                                     self._on_spectrum, queue_size=10)
+        # Dynamic distance input - allows real-time distance updates from
+        # range sensor, operator input, or localisation system.
+        self.sub_distance = rospy.Subscriber("~source_distance", Float64,
+                                             self._on_distance, queue_size=2)
 
-        rospy.loginfo("Activity node ready. Window=%.1fs, %d isotopes configured.",
-                      self.counting_window_s, len(self.isotopes))
+        rospy.loginfo("Activity node ready. Window=%.1fs, %d isotopes configured. "
+                      "distance=%.3fm, solid_angle=%.6f",
+                      self.counting_window_s, len(self.isotopes),
+                      self.source_distance_m, self.solid_angle_fraction)
 
     def _load_energy_cal(self, path):
         if not path or not os.path.exists(path):
@@ -167,6 +224,22 @@ class ActivityNode(object):
             return {'counting_window_s': 60.0, 'min_net_counts': 400, 'isotopes': {}}
         with open(path, 'r') as f:
             return yaml.safe_load(f)
+
+    def _update_solid_angle(self):
+        """Recompute solid angle fraction from current source_distance_m."""
+        if self.source_distance_m > 0:
+            self.solid_angle_fraction = gegi_solid_angle_fraction(self.source_distance_m)
+        else:
+            self.solid_angle_fraction = 0.0
+
+    def _on_distance(self, msg):
+        """Callback for dynamic distance updates (std_msgs/Float64, metres)."""
+        new_dist = msg.data
+        if new_dist > 0 and abs(new_dist - self.source_distance_m) > 0.001:
+            self.source_distance_m = new_dist
+            self._update_solid_angle()
+            rospy.loginfo("Activity node: distance updated to %.3fm -> solid_angle=%.6f",
+                          self.source_distance_m, self.solid_angle_fraction)
 
     def _on_spectrum(self, msg):
         """Accumulate incoming spectrum snapshots into the counting window."""
@@ -205,6 +278,17 @@ class ActivityNode(object):
         # Dead-time correction factor
         dt_correction = real_time_s / live_time_s if live_time_s > 0 else 1.0
 
+        # Dead-time status is useful for downstream QA when detector run-info may
+        # be unavailable or unresolved (e.g., all-zero dead-time path).
+        if real_time_ms <= 0:
+            dead_time_status = 'invalid_no_realtime'
+        elif dead_time_ms < 0 or dead_time_ms > real_time_ms:
+            dead_time_status = 'invalid_range'
+        elif dead_time_ms == 0:
+            dead_time_status = 'zero_or_unavailable'
+        else:
+            dead_time_status = 'valid'
+
         results = []
         total_activity_Bq = 0.0
 
@@ -212,8 +296,39 @@ class ActivityNode(object):
             result = self._compute_isotope_activity(
                 iso, spectrum, live_time_s, dt_correction)
             results.append(result)
-            if result['valid']:
-                total_activity_Bq += result['activity_Bq']
+
+        # Compute total activity, combining same-source isotope peaks.
+        # Co-60 emits two gammas per decay (1173 + 1332 keV); each peak
+        # independently measures the same source activity. Average them
+        # (inverse-variance weighted) rather than summing.
+        source_activities = {}  # source_name -> (weighted_sum, weight_sum)
+        for r in results:
+            if not r['valid']:
+                continue
+            # Group by source (strip peak suffix like "_1173", "_1332")
+            name = r['isotope']
+            # Identify Co-60 peaks as same source
+            if 'Co60' in name or 'Co-60' in name:
+                source_key = 'Co-60'
+            elif 'Cs137' in name or 'Cs-137' in name:
+                source_key = 'Cs-137'
+            else:
+                source_key = name
+
+            a = r['activity_Bq']
+            sigma = r['sigma_activity_Bq']
+            if sigma > 0:
+                w = 1.0 / (sigma * sigma)
+            else:
+                w = 1.0
+            if source_key in source_activities:
+                ws, wt = source_activities[source_key]
+                source_activities[source_key] = (ws + a * w, wt + w)
+            else:
+                source_activities[source_key] = (a * w, w)
+
+        for _key, (ws, wt) in source_activities.items():
+            total_activity_Bq += ws / wt if wt > 0 else 0.0
 
         # Convert to MBq
         total_activity_MBq = total_activity_Bq / 1.0e6
@@ -234,7 +349,10 @@ class ActivityNode(object):
             'real_time_s': real_time_s,
             'live_time_s': live_time_s,
             'dead_time_fraction': dead_time_ms / float(real_time_ms) if real_time_ms > 0 else 0.0,
+            'dead_time_status': dead_time_status,
             'dt_correction_factor': dt_correction,
+            'source_distance_m': self.source_distance_m,
+            'solid_angle_fraction': self.solid_angle_fraction,
             'total_activity_MBq': total_activity_MBq,
             'isotopes': results_MBq
         }
@@ -294,33 +412,33 @@ class ActivityNode(object):
         valid = net_peak_area >= self.min_net_counts
 
         # Activity calculation
-        # Priority: 1) empirical calibration factor, 2) intrinsic eff + solid angle,
-        #           3) manual efficiency override
+        # Uses intrinsic efficiency (geometry-independent detector constant) combined
+        # with solid angle from source distance. The intrinsic efficiency is either:
+        #   - Derived from empirical calibration at calibration_distance (most accurate)
+        #   - From PHDS polynomial (theoretical fallback)
+        # This approach works at ANY distance without recalibration.
         activity_Bq = 0.0
         epsilon_used = 0.0
+        method_used = 'none'
         if net_corrected > 0 and valid:
-            if iso.calibration_factor > 0:
-                # Use empirical calibration factor (Bq per net count per second)
-                count_rate = net_corrected / live_time_s if live_time_s > 0 else 0.0
-                activity_Bq = count_rate * iso.calibration_factor
-                epsilon_used = iso.calibration_factor
-            elif iso.intrinsic_efficiency > 0 and self.solid_angle_fraction > 0:
-                # First principles using PHDS intrinsic efficiency curve:
-                # A = N_net / (eps_intrinsic * Omega/(4pi) * I_gamma * t_live)
+            if iso.intrinsic_efficiency > 0 and self.solid_angle_fraction > 0:
+                # First principles: A = N_net / (eps_intrinsic * Omega/(4pi) * I_gamma * t_live)
                 epsilon_abs = iso.intrinsic_efficiency * self.solid_angle_fraction
                 epsilon_used = epsilon_abs
                 activity_Bq = net_corrected / (
                     epsilon_abs * iso.emission_probability * live_time_s)
+                method_used = 'intrinsic_efficiency'
             elif iso.efficiency > 0 and iso.emission_probability > 0:
-                # Manual absolute efficiency override
+                # Manual absolute efficiency override (legacy)
                 epsilon_used = iso.efficiency
                 activity_Bq = net_corrected / (
                     iso.efficiency * iso.emission_probability * live_time_s)
+                method_used = 'manual_efficiency'
             else:
-                # No calibration available - report count rate only
                 activity_Bq = 0.0
                 rospy.logwarn_throttle(30,
-                    "Isotope %s: set solid_angle_fraction or calibration_factor",
+                    "Isotope %s: cannot compute activity. Set source_distance_m "
+                    "or provide calibration_factor for efficiency derivation.",
                     iso.name)
 
         # Uncertainty on activity (propagated from counting statistics)
@@ -334,6 +452,8 @@ class ActivityNode(object):
             'intrinsic_efficiency': iso.intrinsic_efficiency,
             'solid_angle_fraction': self.solid_angle_fraction,
             'absolute_efficiency': iso.intrinsic_efficiency * self.solid_angle_fraction,
+            'source_distance_m': self.source_distance_m,
+            'method': method_used,
             'gross_counts': gross,
             'background_counts': background,
             'net_peak_area': net_peak_area,

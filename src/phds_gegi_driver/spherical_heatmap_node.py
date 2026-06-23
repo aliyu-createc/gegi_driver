@@ -10,7 +10,9 @@ This avoids depth ambiguity by only estimating source direction.
 """
 from __future__ import print_function
 
+import csv
 import json
+import os
 import threading
 from collections import deque
 
@@ -72,16 +74,16 @@ class SphericalHeatmapNode(object):
     def __init__(self):
         self.radius = rospy.get_param("~radius", 0.5)  # 1m diameter
         self.n_points = int(rospy.get_param("~n_points", 8000))
-        self.window_s = rospy.get_param("~window_s", 120.0)
+        self.window_s = rospy.get_param("~window_s", 180.0)
         self.update_period_s = rospy.get_param("~update_period_s", 2.0)
         self.min_events = int(rospy.get_param("~min_events", 50))
         self.max_events = int(rospy.get_param("~max_events", 3000))
-        self.sigma_floor = rospy.get_param("~sigma_floor", 0.12)
+        self.sigma_floor = rospy.get_param("~sigma_floor", 0.04)
         self.max_uncertainty = rospy.get_param("~max_uncertainty", 0.15)
         self.hemisphere_only = rospy.get_param("~hemisphere_only", True)
         self.max_peaks = int(rospy.get_param("~max_peaks", 5))
-        self.peak_min_separation_deg = rospy.get_param("~peak_min_separation_deg", 15.0)
-        self.peak_threshold = rospy.get_param("~peak_threshold", 0.4)  # fraction of max score
+        self.peak_min_separation_deg = rospy.get_param("~peak_min_separation_deg", 25.0)
+        self.peak_threshold = rospy.get_param("~peak_threshold", 0.75)  # fraction of max score
         self.refine_peaks = rospy.get_param("~refine_peaks", True)
 
         # Build sphere grid
@@ -97,6 +99,12 @@ class SphericalHeatmapNode(object):
         self.events = deque()
         self.lock = threading.Lock()
 
+        # CSV export settings
+        self.csv_output_dir = rospy.get_param("~csv_output_dir", "/opt/phds_gegi_driver/data")
+        self.csv_enabled = rospy.get_param("~csv_enabled", False)
+        self.raster_cell_m = rospy.get_param("~raster_cell_m", 0.005)  # 5mm cells
+        self.raster_fov_m = rospy.get_param("~raster_fov_m", 0.5)  # +/-0.5m coverage
+
         self.sub = rospy.Subscriber("/compton_event", ComptonEvent, self.on_event, queue_size=600)
         self.pub_cloud = rospy.Publisher("/sphere_heatmap", PointCloud2, queue_size=2)
         self.pub_peak = rospy.Publisher("/source_direction", PoseStamped, queue_size=2)
@@ -104,6 +112,7 @@ class SphericalHeatmapNode(object):
         self.pub_isotopes = rospy.Publisher("/source_isotopes", String, queue_size=2)
 
         self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
+        self.save_srv = rospy.Service("~save_csv", Trigger, self._handle_save_csv)
 
         # Subscribe to activity results for absolute dose rate scaling
         self._dose_rate_uSv_h = {}  # isotope display name -> dose rate in uSv/h
@@ -264,8 +273,12 @@ class SphericalHeatmapNode(object):
         confidence = best_avg / max(total_avg, 1e-9)
         return best_name, confidence
 
-    def _is_local_maximum(self, idx, scores, radius_rad=0.10):
-        """Check if point idx is a local maximum within the given angular radius."""
+    def _is_local_maximum(self, idx, scores, radius_rad=0.18):
+        """Check if point idx is a local maximum within the given angular radius.
+        
+        radius_rad=0.18 (~10.3 deg) ensures only dominant peaks survive,
+        rejecting Compton ring sidelobes which are typically narrower.
+        """
         center_dir = self.directions[idx]
         cos_angles = self.directions.dot(center_dir)
         neighbors = np.where((cos_angles > np.cos(radius_rad)) & (cos_angles < 1.0 - 1e-9))[0]
@@ -315,12 +328,12 @@ class SphericalHeatmapNode(object):
 
         return peaks
 
-    def _refine_peak_centroid(self, peak_idx, scores, radius_rad=0.06):
+    def _refine_peak_centroid(self, peak_idx, scores, radius_rad=0.04):
         """Refine peak location using score-weighted centroid of nearby points.
 
         Instead of just taking the grid point with the highest score, compute
         a weighted average direction using all points within radius_rad.
-        Uses a tight radius (0.06 rad ~ 3.4 deg) and high weighting exponent
+        Uses a tight radius (0.04 rad ~ 2.3 deg) and high weighting exponent
         to avoid bias from neighboring sources.
         """
         center_dir = self.directions[peak_idx]
@@ -399,34 +412,39 @@ class SphericalHeatmapNode(object):
             iso_peaks = self._find_peaks(iso_scores)
             if not iso_peaks:
                 continue
-            # Take only the strongest peak for this isotope
-            pidx = iso_peaks[0]
-            # Refine peak location using score-weighted centroid
-            if self.refine_peaks:
-                refined_pos = self._refine_peak_centroid(pidx, iso_scores)
-            else:
-                refined_pos = self.sphere_points[pidx]
-            # Convert sphere position to real-world coordinate at source plane
-            # Y_real = distance * Y_sphere / X_sphere (ray-plane intersection)
-            x_s = float(refined_pos[0])
-            y_s = float(refined_pos[1])
-            z_s = float(refined_pos[2])
-            if abs(x_s) > 1e-6:
-                y_real = self.radius * y_s / x_s
-                z_real = self.radius * z_s / x_s
-            else:
-                y_real = y_s
-                z_real = z_s
-            p = Pose()
-            p.position.x = self.radius  # source distance along X
-            p.position.y = y_real
-            p.position.z = z_real
-            p.orientation.w = 1.0
-            peaks_msg.poses.append(p)
-            # Include event count so plotter can scale by activity
-            isotope_labels.append("{}:{}".format(iso_name, iso_count))
+            # Report ALL detected peaks for this isotope (supports multiple same-isotope sources)
+            for pidx in iso_peaks:
+                # Refine peak location using score-weighted centroid
+                if self.refine_peaks:
+                    refined_pos = self._refine_peak_centroid(pidx, iso_scores)
+                else:
+                    refined_pos = self.sphere_points[pidx]
+                # Convert sphere position to real-world coordinate at source plane
+                # Y_real = distance * Y_sphere / X_sphere (ray-plane intersection)
+                x_s = float(refined_pos[0])
+                y_s = float(refined_pos[1])
+                z_s = float(refined_pos[2])
+                if abs(x_s) > 1e-6:
+                    y_real = self.radius * y_s / x_s
+                    z_real = self.radius * z_s / x_s
+                else:
+                    y_real = y_s
+                    z_real = z_s
+                p = Pose()
+                p.position.x = self.radius  # source distance along X
+                p.position.y = y_real
+                p.position.z = z_real
+                p.orientation.w = 1.0
+                peaks_msg.poses.append(p)
+                isotope_labels.append("{}:{}".format(iso_name, iso_count))
 
         self.pub_peaks.publish(peaks_msg)
+
+        # Store peaks for CSV export (Y,Z in sphere coordinates + isotope name)
+        self._last_peaks = []
+        for pose in peaks_msg.poses:
+            self._last_peaks.append((pose.position.y, pose.position.z))
+        self._last_isotope_labels = isotope_labels
 
         # Publish isotope identification with counts
         iso_msg = String()
@@ -466,7 +484,18 @@ class SphericalHeatmapNode(object):
             combined = np.maximum(combined, v)
         norm_scores = combined
 
+        # Store for CSV export (service call or auto-save)
+        self._last_iso_scores = iso_norm_scores
+        self._last_combined = combined
+
         self._publish_cloud(now, norm_scores, iso_norm_scores)
+
+        # Auto-save CSV on every update cycle
+        if self.csv_enabled:
+            try:
+                self._save_csv(iso_norm_scores, combined)
+            except Exception as e:
+                rospy.logerr_throttle(10.0, "CSV save failed: %s", e)
 
         rospy.loginfo_throttle(5.0,
                                "sphere heatmap: %d events, %d sources [%s], peak dose=%.3f uSv/h, dose_rates=%s",
@@ -474,6 +503,141 @@ class SphericalHeatmapNode(object):
                                iso_msg.data,
                                float(norm_scores.max()),
                                dose_rates)
+
+    def _handle_save_csv(self, req):
+        """Service handler to trigger a one-shot CSV save."""
+        if hasattr(self, '_last_iso_scores') and hasattr(self, '_last_combined'):
+            self._save_csv(self._last_iso_scores, self._last_combined)
+            return TriggerResponse(success=True, message="CSV saved to " + self.csv_output_dir)
+        return TriggerResponse(success=False, message="No heatmap data available yet")
+
+    def _save_csv(self, iso_norm_scores, combined_scores):
+        """Save both raw and rasterised CSV files."""
+        self._last_iso_scores = iso_norm_scores
+        self._last_combined = combined_scores
+
+        try:
+            if not os.path.exists(self.csv_output_dir):
+                os.makedirs(self.csv_output_dir)
+        except OSError:
+            pass
+
+        points = self.sphere_points
+        n = points.shape[0]
+        cs137 = iso_norm_scores.get('Cs-137', np.zeros(n))
+        co60 = iso_norm_scores.get('Co-60', np.zeros(n))
+
+        # --- Raw points CSV ---
+        raw_path = os.path.join(self.csv_output_dir, "gegi_heatmap_raw.csv")
+        with open(raw_path, 'w') as f:
+            f.write("x,y,z,intensity\n")
+            for i in range(n):
+                f.write("{:.5f},{:.5f},{:.5f},{:.6f}\n".format(
+                    points[i, 0], points[i, 1], points[i, 2],
+                    combined_scores[i]))
+
+        # --- Rasterised grid CSV ---
+        peaks = getattr(self, '_last_peaks', [])
+        peak_labels = getattr(self, '_last_isotope_labels', [])
+        self._save_rasterised_csv(points, combined_scores, cs137, co60, peaks, peak_labels)
+
+    @staticmethod
+    def _gaussian_smooth(grid, sigma=3.0):
+        """2D Gaussian smoothing - same as live 2D heatmap."""
+        from scipy.ndimage import gaussian_filter
+        return gaussian_filter(grid, sigma=sigma)
+
+    def _save_rasterised_csv(self, points, combined, cs137, co60, peaks=None, peak_labels=None):
+        """Rasterise sphere heatmap to CSV using the same algorithm as the live 2D heatmap.
+
+        Pipeline:
+        1. Bin per-isotope scores into Y-Z grid using direct sphere coordinates
+        2. scipy gaussian_filter(sigma=5.0) - higher than live heatmap to compensate
+           for matplotlib's bilinear interpolation which the CSV doesn't have
+        3. Cosine correction + zero outside sphere
+        4. Per-peak Gaussian blob masking (sigma=0.04m) for source separation
+        """
+        from scipy.ndimage import gaussian_filter
+
+        res = 200  # 200x200 grid
+        extent = 0.2  # +/-200mm (400mm x 400mm)
+
+        y_edges = np.linspace(-extent, extent, res + 1)
+        z_edges = np.linspace(-extent, extent, res + 1)
+        yc = np.linspace(-extent, extent, res)
+        zc = np.linspace(-extent, extent, res)
+        YY, ZZ = np.meshgrid(yc, zc)
+        r2 = YY**2 + ZZ**2
+        R2 = self.radius**2
+
+        def _project_to_2d_grid(scores):
+            """Bin scores onto Y-Z grid with heavy smoothing to eliminate sampling artifacts."""
+            grid = np.zeros((res, res), dtype=np.float64)
+            counts = np.zeros((res, res), dtype=np.float64)
+            y_idx = np.digitize(points[:, 1], y_edges) - 1
+            z_idx = np.digitize(points[:, 2], z_edges) - 1
+            valid = (y_idx >= 0) & (y_idx < res) & (z_idx >= 0) & (z_idx < res)
+            for i in range(len(points)):
+                if valid[i]:
+                    grid[z_idx[i], y_idx[i]] += scores[i]
+                    counts[z_idx[i], y_idx[i]] += 1.0
+            mask = counts > 0
+            grid[mask] /= counts[mask]
+            # sigma=5.0 fully covers inter-point gaps (~20mm spacing / 5.5mm per pixel ~ 3.6 px)
+            grid = gaussian_filter(grid, sigma=5.0)
+            # Cosine correction
+            cos_factor = np.sqrt(np.clip(1.0 - r2 / R2, 0.0, 1.0))
+            grid *= cos_factor
+            grid[r2 > R2] = 0.0
+            return grid
+
+        grid_cs137 = _project_to_2d_grid(cs137)
+        grid_co60 = _project_to_2d_grid(co60)
+
+        # Per-peak pure Gaussian blobs scaled by smoothed grid intensity
+        if peaks and len(peaks) > 0:
+            sigma_blob = 0.05  # 50mm - smooth blob matching live heatmap appearance
+
+            grid_combined = np.zeros((res, res), dtype=np.float64)
+
+            for i, (py, pz) in enumerate(peaks):
+                iso_name = ''
+                if peak_labels and i < len(peak_labels):
+                    iso_name = peak_labels[i].split(':')[0] if ':' in peak_labels[i] else peak_labels[i]
+
+                # Get amplitude from the smoothed grid at peak pixel position
+                # (stable, reflects actual source strength like the live heatmap)
+                peak_yi = int(np.clip((py + extent) / (2.0 * extent) * res, 0, res - 1))
+                peak_zi = int(np.clip((pz + extent) / (2.0 * extent) * res, 0, res - 1))
+
+                if 'Cs-137' in iso_name:
+                    amp = float(grid_cs137[peak_zi, peak_yi])
+                elif 'Co-60' in iso_name:
+                    amp = float(grid_co60[peak_zi, peak_yi])
+                else:
+                    amp = float(max(grid_cs137[peak_zi, peak_yi],
+                                    grid_co60[peak_zi, peak_yi]))
+                if amp < 1e-12:
+                    continue
+
+                # Pure Gaussian blob - no grid multiplication
+                dist = np.sqrt((YY - py)**2 + (ZZ - pz)**2)
+                blob = amp * np.exp(-0.5 * (dist / sigma_blob)**2)
+
+                grid_combined = np.maximum(grid_combined, blob)
+        else:
+            grid_combined = _project_to_2d_grid(combined)
+
+        # Write rasterised CSV with physical x,y,z coordinates
+        raster_path = os.path.join(self.csv_output_dir, "gegi_heatmap_raster.csv")
+        x_coord = self.radius
+        with open(raster_path, 'w') as f:
+            f.write("x,y,z,intensity\n")
+            for zi in range(res):
+                for yi in range(res):
+                    f.write("{:.4f},{:.4f},{:.4f},{:.6f}\n".format(
+                        x_coord, yc[yi], zc[zi],
+                        grid_combined[zi, yi]))
 
     def _publish_cloud(self, stamp, norm_scores, iso_norm_scores):
         """Publish colored PointCloud2 with per-isotope intensity fields.

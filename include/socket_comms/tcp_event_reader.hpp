@@ -69,7 +69,6 @@ namespace phds_gegi_driver::socket_comms {
     private:
         void monitorSocket();
         bool sendCommand(char cmd);  // Low-level send
-        static RunInfo parseRunInfo(const std::string &response);
 
         boost::asio::io_service io_service_;
 
@@ -79,8 +78,12 @@ namespace phds_gegi_driver::socket_comms {
 
         std::thread monitoring_thread_;
 
+        // Event stream socket (monitor thread reads from this continuously).
         boost::asio::ip::tcp::socket socket_;
+        // Command/response socket used for control and status queries.
+        boost::asio::ip::tcp::socket command_socket_;
         std::mutex socket_mutex_;     // Protect socket from concurrent sends
+        std::mutex command_mutex_;    // Serialize command socket access
         std::mutex response_mutex_;   // Held during command response reads; monitorSocket waits on this
 
         std::atomic<bool> running_ {false};

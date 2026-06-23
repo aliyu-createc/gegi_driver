@@ -10,14 +10,30 @@
         <arg name="gegi_port" value="$(arg gegi_port)"/>
     </include>
 
-    <!-- Spectrum accumulator (all events) -->
-    <include file="$(find phds_gegi_driver)/launch/spectrum.launch"/>
+    <!-- Spectrum accumulator (all events).
+         NOTE: live run-info polling is DISABLED by default. The detector
+         multiplexes commands and the event stream on one TCP link, so polling
+         /detector/get_run_info during acquisition contends with (and can stall)
+         the event stream, producing empty spectra/heatmaps. Authoritative
+         dead-time is fetched once after the run by the data_recorder via
+         _fetch_detector_run_info_post_stop. Only re-enable live polling after
+         rebuilding the C++ driver (dedicated command socket) and confirming the
+         event stream is unaffected. -->
+    <include file="$(find phds_gegi_driver)/launch/spectrum.launch">
+        <arg name="use_run_info_deadtime" value="false"/>
+        <arg name="dead_time_poll_hz" value="1.0"/>
+        <arg name="dead_time_topic" value="/detector/dead_time_percent"/>
+        <arg name="publish_dead_time_topic" value="false"/>
+    </include>
 
-    <!-- Spectrum accumulator (singles only - photoelectric events) -->
+    <!-- Spectrum accumulator (singles only): reuses shared dead-time, no direct run-info polling -->
     <include file="$(find phds_gegi_driver)/launch/spectrum.launch">
         <arg name="energy_topic" value="/energy_deposit_singles"/>
         <arg name="spectrum_topic" value="/spectrum_singles"/>
         <arg name="node_name" value="spectrum_singles"/>
+        <arg name="use_run_info_deadtime" value="false"/>
+        <arg name="use_dead_time_topic" value="false"/>
+        <arg name="dead_time_topic" value="/detector/dead_time_percent"/>
     </include>
 
     <!-- Spherical heatmap with isotope ID -->

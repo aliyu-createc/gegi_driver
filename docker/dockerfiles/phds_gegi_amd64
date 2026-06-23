@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         python3-matplotlib \
         python3-numpy \
+        python-scipy \
         ros-melodic-rosbag \
         ros-melodic-rosbridge-server \
         ros-melodic-rosbridge-suite \

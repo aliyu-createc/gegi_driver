@@ -9,6 +9,7 @@
     <arg name="min_events" default="50"/>
     <arg name="max_events" default="3000"/>
     <arg name="hemisphere_only" default="true"/>
+    <arg name="min_peak_separation_deg" default="20.0"/>
 
     <node name="spherical_heatmap" pkg="phds_gegi_driver" type="spherical_heatmap_node.py" output="screen">
         <param name="radius" type="double" value="$(arg radius)" />
@@ -18,5 +19,6 @@
         <param name="min_events" type="int" value="$(arg min_events)" />
         <param name="max_events" type="int" value="$(arg max_events)" />
         <param name="hemisphere_only" type="bool" value="$(arg hemisphere_only)" />
+        <param name="peak_min_separation_deg" type="double" value="$(arg min_peak_separation_deg)" />
     </node>
 </launch>

@@ -5,6 +5,7 @@
 #include <phds_gegi_driver/phds_gegi_driver.hpp>
 
 #include <cmath>
+#include <limits>
 
 namespace { // Anon
     template<typename T>
@@ -37,6 +38,7 @@ namespace phds_gegi_driver {
         getParam(pn, "energy_topic", energy_topic);
         getParam(pn, "singles_energy_topic", singles_energy_topic);
         getParam(pn, "detector_frame", detector_frame_);
+        getParam(pn, "detector_info_cache_max_age_sec", detector_info_cache_max_age_sec_);
 
         constexpr static int OUTPUT_BUFFER_SIZE = 100;
         event_publisher_ = n.advertise<radiation_detector_msgs::ComptonEvent>(event_topic, OUTPUT_BUFFER_SIZE);
@@ -152,20 +154,104 @@ namespace phds_gegi_driver {
         auto run_info = tcp_event_reader_.getRunInfo();
         res.real_time_sec = run_info.real_time_sec;
         res.live_time_sec = run_info.live_time_sec;
-        res.dead_time_percent = run_info.dead_time_percent;
+        const double raw_dead_time_percent = run_info.dead_time_percent;
+        res.dead_time_percent = raw_dead_time_percent;
         res.count_rate_hz = run_info.count_rate_hz;
-        const bool valid = std::isfinite(res.real_time_sec)
-                           && std::isfinite(res.live_time_sec)
-                           && std::isfinite(res.dead_time_percent)
-                           && std::isfinite(res.count_rate_hz)
-                           && res.real_time_sec >= 0.0
-                           && res.live_time_sec >= 0.0
-                           && res.dead_time_percent >= -100.0
-                           && res.dead_time_percent <= 100.0
-                           && res.count_rate_hz >= 0.0;
+        const bool finite = std::isfinite(res.real_time_sec)
+                    && std::isfinite(res.live_time_sec)
+                && std::isfinite(raw_dead_time_percent)
+                    && std::isfinite(res.count_rate_hz);
+        const bool non_negative = res.real_time_sec >= 0.0
+                      && res.live_time_sec >= 0.0
+                  && raw_dead_time_percent >= 0.0
+                  && raw_dead_time_percent <= 100.0
+                      && res.count_rate_hz >= 0.0;
+        const bool idle_zero = res.real_time_sec == 0.0
+                       && res.live_time_sec == 0.0
+                   && raw_dead_time_percent == 0.0
+                       && res.count_rate_hz == 0.0;
+        const bool timing_consistent = res.real_time_sec > 0.0
+                           && res.live_time_sec <= res.real_time_sec + 1e-6;
+        const bool can_derive_dt = timing_consistent && res.real_time_sec > 1e-9;
+        const double derived_dead_time_percent = can_derive_dt
+            ? (100.0 * (1.0 - res.live_time_sec / res.real_time_sec))
+            : std::numeric_limits<double>::quiet_NaN();
+        const bool derived_dead_time_valid = std::isfinite(derived_dead_time_percent)
+            && derived_dead_time_percent >= 0.0
+            && derived_dead_time_percent <= 100.0;
+        // Guard against denormal/garbage live-time values observed from mixed socket traffic.
+        const double live_fraction = timing_consistent && res.real_time_sec > 1e-9
+            ? (res.live_time_sec / res.real_time_sec)
+            : 0.0;
+        const bool live_time_plausible = !timing_consistent
+            || (live_fraction >= 0.05);
+        const bool raw_dead_time_consistent = !can_derive_dt
+            || (std::fabs(raw_dead_time_percent - derived_dead_time_percent) <= 2.0);
 
-        res.success = valid;
-        res.message = valid ? "Run info retrieved" : "Run info response invalid or timed out";
+        bool used_derived_dead_time = false;
+        if (derived_dead_time_valid && !raw_dead_time_consistent) {
+            res.dead_time_percent = derived_dead_time_percent;
+            used_derived_dead_time = true;
+            ROS_WARN_STREAM("Run-info dead time sanitized from real/live times. raw="
+                    << raw_dead_time_percent << " derived=" << derived_dead_time_percent);
+        }
+
+        const bool valid = finite && non_negative
+            && (idle_zero || (timing_consistent
+                      && live_time_plausible
+                      && (raw_dead_time_consistent || derived_dead_time_valid)));
+
+        bool temporally_consistent = true;
+        if (valid && !idle_zero) {
+            const ros::Time now = ros::Time::now();
+            std::lock_guard<std::mutex> history_lock(run_info_history_mutex_);
+            if (has_last_valid_run_info_) {
+                const double wall_dt = (now - last_run_info_stamp_).toSec();
+                if (wall_dt > 0.0) {
+                    const double delta_real = res.real_time_sec - last_run_info_real_time_sec_;
+                    const double delta_live = res.live_time_sec - last_run_info_live_time_sec_;
+                    const bool monotonic = delta_real >= -0.5 && delta_live >= -0.5;
+                    const double max_growth = wall_dt * 3.0 + 5.0;
+                    const bool growth_reasonable = delta_real <= max_growth && delta_live <= max_growth;
+                    // Live time can advance slowly at high dead-time, but if real-time
+                    // advances significantly while live-time remains effectively flat
+                    // under non-zero count rate, this is typically a stale/latched frame.
+                    const bool detector_active = res.count_rate_hz > 1.0;
+                    const bool real_advanced = delta_real >= 5.0;
+                    const bool live_stalled = std::fabs(delta_live) <= 0.25;
+                    const bool stale_live_time = detector_active && real_advanced && live_stalled;
+
+                    temporally_consistent = monotonic && growth_reasonable && !stale_live_time;
+                    if (!temporally_consistent && stale_live_time) {
+                        ROS_WARN_STREAM("Rejecting run-info sample due to stalled live-time: "
+                                        << "delta_real=" << delta_real
+                                        << " delta_live=" << delta_live
+                                        << " count_rate_hz=" << res.count_rate_hz);
+                    }
+                }
+            }
+
+            if (temporally_consistent) {
+                has_last_valid_run_info_ = true;
+                last_run_info_real_time_sec_ = res.real_time_sec;
+                last_run_info_live_time_sec_ = res.live_time_sec;
+                last_run_info_stamp_ = now;
+            }
+        }
+
+        const bool final_valid = valid && temporally_consistent;
+        res.success = final_valid;
+        if (!final_valid) {
+            res.real_time_sec = std::numeric_limits<double>::quiet_NaN();
+            res.live_time_sec = std::numeric_limits<double>::quiet_NaN();
+            res.dead_time_percent = std::numeric_limits<double>::quiet_NaN();
+            res.count_rate_hz = std::numeric_limits<double>::quiet_NaN();
+            res.message = "Run info response invalid or timed out";
+        } else if (used_derived_dead_time) {
+            res.message = "Run info retrieved (dead time sanitized from real/live)";
+        } else {
+            res.message = "Run info retrieved";
+        }
         return true;
     }
 
@@ -190,8 +276,42 @@ namespace phds_gegi_driver {
                            && res.batt2_percent >= 0
                            && res.batt2_percent <= 100;
 
-        res.success = valid;
-        res.message = valid ? "Detector info retrieved" : "Detector info response invalid or timed out";
+        if (valid) {
+            {
+                std::lock_guard<std::mutex> lock(detector_info_cache_mutex_);
+                has_last_valid_detector_info_ = true;
+                last_detector_info_ = detector_info;
+                last_detector_info_stamp_ = ros::Time::now();
+            }
+            res.success = true;
+            res.message = "Detector info retrieved";
+            return true;
+        }
+
+        bool used_cached = false;
+        {
+            std::lock_guard<std::mutex> lock(detector_info_cache_mutex_);
+            if (has_last_valid_detector_info_) {
+                const double age_s = (ros::Time::now() - last_detector_info_stamp_).toSec();
+                if (age_s >= 0.0 && age_s <= detector_info_cache_max_age_sec_) {
+                    res.serial_number = last_detector_info_.serial_number;
+                    res.detector_temp_kelvin = last_detector_info_.detector_temp_kelvin;
+                    res.detector_bias_status = last_detector_info_.detector_bias_status;
+                    res.line_power_status = last_detector_info_.line_power_status;
+                    res.batt1_percent = last_detector_info_.batt1_percent;
+                    res.batt2_percent = last_detector_info_.batt2_percent;
+                    used_cached = true;
+                }
+            }
+        }
+
+        if (used_cached) {
+            res.success = true;
+            res.message = "Detector info retrieved (cached last valid sample)";
+        } else {
+            res.success = false;
+            res.message = "Detector info response invalid or timed out";
+        }
         return true;
     }
 
