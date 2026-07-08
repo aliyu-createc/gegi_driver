@@ -491,7 +491,9 @@ namespace phds_gegi_driver::socket_comms {
     }
 
     bool TcpEventReader::sendTimedAcquisition(char preset_cmd) {
-        if (preset_cmd < '1' || preset_cmd > '5') {
+        // Presets '1'-'8' map to 5/10/15/20/25/30/45/60-minute (live-time)
+        // acquisitions per the GeGI remote-command manual.
+        if (preset_cmd < '1' || preset_cmd > '8') {
             std::cerr << "Invalid timed acquisition preset command '" << preset_cmd << "'" << std::endl;
             return false;
         }
@@ -585,48 +587,21 @@ namespace phds_gegi_driver::socket_comms {
                 event_lock.lock();
             }
 
-            // Run-info frame: Try multiple layout hypotheses
-            // Layout A (24 bytes): uint32 real_s + f64 live_s + f64 dead_% + uint32 rate
-            // Layout B (16 bytes): uint32 real_s + uint32 live_s + uint32 dead_%×100 + uint32 rate
-            // Layout C (16 bytes): uint32 real_ms + uint32 live_ms + uint32 dead_%×100 + uint32 rate
-            // Layout D (32 bytes): f64 real_s + f64 live_s + f64 dead_% + f64 rate
-            constexpr size_t FRAME_A_BYTES = 24;
-            constexpr size_t FRAME_B_BYTES = 16;
-            constexpr size_t FRAME_D_BYTES = 32;
+            // Run-info frame, per the GeGI remote-command manual (command 'i'):
+            //   offset  0: int32  realTime            (seconds)
+            //   offset  4: double liveTime            (seconds)
+            //   offset 12: double deadTimePercentage  (percent)
+            //   offset 20: double countRate           (counts per second)
+            // Total 28 bytes, little-endian. We decode this single documented
+            // layout deterministically rather than guessing among hypotheses.
+            constexpr size_t FRAME_BYTES = 28;
 
-            auto decode_layout_A = [&](const char *base) {
+            auto decode_run_info = [&](const char *base) {
                 RunInfo decoded;
                 decoded.real_time_sec = static_cast<double>(readU32(base + 0, false));
                 decoded.live_time_sec = readF64(base + 4, false);
                 decoded.dead_time_percent = readF64(base + 12, false);
-                decoded.count_rate_hz = static_cast<double>(readU32(base + 20, false));
-                return decoded;
-            };
-
-            auto decode_layout_B = [&](const char *base) {
-                RunInfo decoded;
-                decoded.real_time_sec = static_cast<double>(readU32(base + 0, false));
-                decoded.live_time_sec = static_cast<double>(readU32(base + 4, false));
-                decoded.dead_time_percent = static_cast<double>(readU32(base + 8, false)) / 100.0;
-                decoded.count_rate_hz = static_cast<double>(readU32(base + 12, false));
-                return decoded;
-            };
-
-            auto decode_layout_C = [&](const char *base) {
-                RunInfo decoded;
-                decoded.real_time_sec = static_cast<double>(readU32(base + 0, false)) / 1000.0;
-                decoded.live_time_sec = static_cast<double>(readU32(base + 4, false)) / 1000.0;
-                decoded.dead_time_percent = static_cast<double>(readU32(base + 8, false)) / 100.0;
-                decoded.count_rate_hz = static_cast<double>(readU32(base + 12, false));
-                return decoded;
-            };
-
-            auto decode_layout_D = [&](const char *base) {
-                RunInfo decoded;
-                decoded.real_time_sec = readF64(base + 0, false);
-                decoded.live_time_sec = readF64(base + 8, false);
-                decoded.dead_time_percent = readF64(base + 16, false);
-                decoded.count_rate_hz = readF64(base + 24, false);
+                decoded.count_rate_hz = readF64(base + 20, false);
                 return decoded;
             };
 
@@ -666,41 +641,31 @@ namespace phds_gegi_driver::socket_comms {
             std::vector<char> last_buffer;
             std::string found_layout;
 
-            const std::array<char, 2> cmds{{'r', 'R'}};
-            for (char cmd : cmds) {
-                for (int attempt = 0; attempt < 3 && !found; ++attempt) {
-                    const auto deadline = std::chrono::steady_clock::now()
-                                          + std::chrono::milliseconds(1500);
-                    auto buffer = sendAndAccumulateRaw(
-                        response_socket, cmd, deadline, 16384);
+            // Command 'i' = "Requests Run Information". (Note: 'r' is the
+            // detector's reachback/file-save command — do NOT use it here.)
+            // The response shares the event socket, so when acquisition is
+            // streaming the 28-byte frame may be surrounded by event packets;
+            // we scan offsets and accept the first self-consistent frame. When
+            // queried post-stop (the intended path) the reply arrives clean and
+            // the first offset matches immediately.
+            for (int attempt = 0; attempt < 3 && !found; ++attempt) {
+                const auto deadline = std::chrono::steady_clock::now()
+                                      + std::chrono::milliseconds(1500);
+                auto buffer = sendAndAccumulateRaw(
+                    response_socket, 'i', deadline, 16384);
 
-                    if (buffer.size() >= FRAME_D_BYTES) {
-                        for (size_t i = 0; i + FRAME_D_BYTES <= buffer.size() && !found; ++i) {
-                            // Try layout D (all f64, 32 bytes)
-                            auto d = decode_layout_D(buffer.data() + i);
-                            if (plausible_run_info(d)) { info = d; found = true; found_layout = "D(32B all-f64)"; break; }
+                if (buffer.size() >= FRAME_BYTES) {
+                    for (size_t i = 0; i + FRAME_BYTES <= buffer.size() && !found; ++i) {
+                        auto decoded = decode_run_info(buffer.data() + i);
+                        if (plausible_run_info(decoded)) {
+                            info = decoded;
+                            found = true;
+                            found_layout = "i(28B u32+f64+f64+f64)";
+                            break;
                         }
                     }
-                    if (!found && buffer.size() >= FRAME_A_BYTES) {
-                        for (size_t i = 0; i + FRAME_A_BYTES <= buffer.size() && !found; ++i) {
-                            // Try layout A (u32+f64+f64+u32, 24 bytes)
-                            auto a = decode_layout_A(buffer.data() + i);
-                            if (plausible_run_info(a)) { info = a; found = true; found_layout = "A(24B u32+f64+f64+u32)"; break; }
-                        }
-                    }
-                    if (!found && buffer.size() >= FRAME_B_BYTES) {
-                        for (size_t i = 0; i + FRAME_B_BYTES <= buffer.size() && !found; ++i) {
-                            // Try layout B (all u32, 16 bytes, dead×100)
-                            auto b = decode_layout_B(buffer.data() + i);
-                            if (plausible_run_info(b)) { info = b; found = true; found_layout = "B(16B all-u32)"; break; }
-                            // Try layout C (u32 ms, 16 bytes)
-                            auto c = decode_layout_C(buffer.data() + i);
-                            if (plausible_run_info(c)) { info = c; found = true; found_layout = "C(16B ms-u32)"; break; }
-                        }
-                    }
-                    last_buffer = buffer;
                 }
-                if (found) break;
+                last_buffer = buffer;
             }
 
             if (!found) {
@@ -798,7 +763,9 @@ namespace phds_gegi_driver::socket_comms {
                 channels.emplace_back(&socket_, "stream");
             }
 
-            const std::array<char, 2> cmds{{'d', 'D'}};
+            // Command 'd' = "Requests Detector Status Info" (the only valid
+            // form; 'D' is undefined in the GeGI protocol).
+            const std::array<char, 1> cmds{{'d'}};
             for (const auto &channel : channels) {
                 boost::asio::ip::tcp::socket &response_socket = *channel.first;
                 const bool using_stream_socket = (&response_socket == &socket_);

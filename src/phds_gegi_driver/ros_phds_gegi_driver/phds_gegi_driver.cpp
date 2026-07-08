@@ -327,7 +327,8 @@ namespace phds_gegi_driver {
                                                      phds_gegi_driver::StartTimedAcquisition::Response &res) {
         ROS_INFO_STREAM("Received start_timed_acquisition request: " << req.duration_minutes << " minutes");
 
-        // Map duration to GeGI preset command character ('1'=5min, '2'=10min, etc.)
+        // Map duration to GeGI preset command character (manual: '1'=5min,
+        // '2'=10, '3'=15, '4'=20, '5'=25, '6'=30, '7'=45, '8'=60 min).
         char cmd;
         switch (req.duration_minutes) {
             case 5:  cmd = '1'; break;
@@ -335,9 +336,12 @@ namespace phds_gegi_driver {
             case 15: cmd = '3'; break;
             case 20: cmd = '4'; break;
             case 25: cmd = '5'; break;
+            case 30: cmd = '6'; break;
+            case 45: cmd = '7'; break;
+            case 60: cmd = '8'; break;
             default:
                 res.success = false;
-                res.message = "Unsupported duration. Valid values: 5, 10, 15, 20, 25 minutes";
+                res.message = "Unsupported duration. Valid values: 5, 10, 15, 20, 25, 30, 45, 60 minutes";
                 return true;
         }
 
