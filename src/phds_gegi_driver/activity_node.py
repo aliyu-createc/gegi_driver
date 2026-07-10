@@ -41,7 +41,7 @@ import threading
 import numpy as np
 import rospy
 import yaml
-from std_msgs.msg import Float64, String
+from std_msgs.msg import Float64, Int32, String
 from std_srvs.srv import Trigger, TriggerResponse
 from radiation_detector_msgs.msg import Spectrum
 
@@ -85,12 +85,16 @@ def gegi_intrinsic_efficiency(energy_keV):
 class IsotopeConfig(object):
     """Holds ROI channel indices and calibration data for one isotope."""
 
-    def __init__(self, name, cfg, bin_edges, calibration_distance_m=0.5):
+    def __init__(self, name, cfg, bin_edges, calibration_distance_m=0.5,
+                 crystal_radius_m=GEGI_CRYSTAL_RADIUS_M):
         self.name = name
         self.energy_keV = cfg['energy_keV']
         self.emission_probability = cfg['emission_probability']
         self.calibration_factor = cfg.get('calibration_factor', 0.0) or 0.0
         self.efficiency = cfg.get('efficiency', 0.0) or 0.0
+        # Linear attenuation coefficient (1/m) of the shielding-plate material at
+        # this gamma line, for the in-line shielding correction (0 = none).
+        self.mu_shield_per_m = cfg.get('mu_shield_per_m', 0.0) or 0.0
 
         # Intrinsic efficiency: the geometry-independent detector constant.
         # Priority:
@@ -102,7 +106,7 @@ class IsotopeConfig(object):
             self.intrinsic_efficiency = measured
         elif self.calibration_factor > 0 and calibration_distance_m > 0:
             # Derive from empirical calibration: eps = 1/(CF * omega_cal * I_gamma)
-            omega_cal = gegi_solid_angle_fraction(calibration_distance_m)
+            omega_cal = gegi_solid_angle_fraction(calibration_distance_m, crystal_radius_m)
             if omega_cal > 0 and self.emission_probability > 0:
                 self.intrinsic_efficiency = 1.0 / (
                     self.calibration_factor * omega_cal * self.emission_probability)
@@ -140,9 +144,14 @@ class ActivityNode(object):
         # for geometry-independent activity measurement.
         self.source_distance_m = rospy.get_param("~source_distance_m", 0.0)
         self.calibration_distance_m = rospy.get_param("~calibration_distance_m", 0.5)
+        # Detector crystal radius (loaded from config below; param overrides).
+        self.crystal_radius_m = rospy.get_param("~crystal_radius_m", 0.0)
 
-        # Compute initial solid angle from distance (updated dynamically)
-        self._update_solid_angle()
+        # In-line shielding: operator sets the number of identical plates; the
+        # driver derives the standoff and the per-line attenuation from it.
+        self.n_shielding_plates = int(rospy.get_param("~n_shielding_plates", 0))
+        self.plate_thickness_m = 0.0
+        self.base_standoff_m = 0.0
 
         # Load energy calibration
         self.bin_edges = self._load_energy_cal(cal_path)
@@ -155,12 +164,32 @@ class ActivityNode(object):
             "~counting_window_s", iso_cfg.get('counting_window_s', 60.0))
         self.min_net_counts = iso_cfg.get('min_net_counts', 400)
 
+        # Crystal radius from config if not overridden by param.
+        if self.crystal_radius_m <= 0:
+            self.crystal_radius_m = iso_cfg.get('crystal_radius_m', GEGI_CRYSTAL_RADIUS_M) \
+                or GEGI_CRYSTAL_RADIUS_M
+
         # Allow source_distance_m from config file if not set via param
         if self.source_distance_m <= 0:
             self.source_distance_m = iso_cfg.get('source_distance_m', 0.0) or 0.0
-            self._update_solid_angle()
         if self.calibration_distance_m <= 0:
             self.calibration_distance_m = iso_cfg.get('calibration_distance_m', 0.5) or 0.5
+
+        # Shielding geometry (plate thickness + base standoff). base_standoff_m
+        # defaults to the configured source distance (i.e. the 0-plate distance).
+        shield_cfg = iso_cfg.get('shielding', {}) or {}
+        self.plate_thickness_m = float(shield_cfg.get('plate_thickness_m', 0.0) or 0.0)
+        self.base_standoff_m = float(
+            shield_cfg.get('base_standoff_m', self.source_distance_m) or 0.0)
+        # Permanently-mounted plates always in the beam (e.g. the fixed shield on
+        # an upward-facing frame). base_standoff_m is the BARE (0-steel) distance;
+        # these plates are added to whatever the operator sets via n_shielding_plates.
+        self.base_shield_plates = int(shield_cfg.get('base_shield_plates', 0) or 0)
+
+        # If shielding geometry is configured, derive the standoff from n_plates;
+        # otherwise keep the static source_distance_m.
+        self._recompute_distance_from_plates()
+        self._update_solid_angle()
 
         # Fallback solid_angle_fraction from config (used only if distance not set)
         if self.solid_angle_fraction <= 0:
@@ -170,7 +199,8 @@ class ActivityNode(object):
         self.isotopes = []
         for name, cfg in iso_cfg.get('isotopes', {}).items():
             try:
-                ic = IsotopeConfig(name, cfg, self.bin_edges, self.calibration_distance_m)
+                ic = IsotopeConfig(name, cfg, self.bin_edges,
+                                   self.calibration_distance_m, self.crystal_radius_m)
                 self.isotopes.append(ic)
                 rospy.loginfo("  Isotope %s: peak channels %d-%d, E=%.1f keV, "
                               "eps_intrinsic=%.6f",
@@ -189,6 +219,10 @@ class ActivityNode(object):
         # Publishers
         self.pub_total = rospy.Publisher("~total_activity", Float64, queue_size=2)
         self.pub_results = rospy.Publisher("~results", String, queue_size=2)
+        # Effective source distance (base_standoff + n_plates * thickness), latched
+        # so dose/imaging nodes (data_recorder, spherical_heatmap) track shielding.
+        self.pub_distance = rospy.Publisher("~effective_source_distance", Float64,
+                                            queue_size=1, latch=True)
 
         # Services
         self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
@@ -200,11 +234,17 @@ class ActivityNode(object):
         # range sensor, operator input, or localisation system.
         self.sub_distance = rospy.Subscriber("~source_distance", Float64,
                                              self._on_distance, queue_size=2)
+        # Operator sets the number of in-line shielding plates for hot trays;
+        # the driver re-derives the standoff and attenuation from it.
+        self.sub_plates = rospy.Subscriber("~n_shielding_plates", Int32,
+                                           self._on_n_plates, queue_size=2)
 
         rospy.loginfo("Activity node ready. Window=%.1fs, %d isotopes configured. "
-                      "distance=%.3fm, solid_angle=%.6f",
+                      "distance=%.3fm, solid_angle=%.6f, shielding_plates=%d",
                       self.counting_window_s, len(self.isotopes),
-                      self.source_distance_m, self.solid_angle_fraction)
+                      self.source_distance_m, self.solid_angle_fraction,
+                      self.n_shielding_plates)
+        self._publish_distance()
 
     def _load_energy_cal(self, path):
         if not path or not os.path.exists(path):
@@ -228,9 +268,42 @@ class ActivityNode(object):
     def _update_solid_angle(self):
         """Recompute solid angle fraction from current source_distance_m."""
         if self.source_distance_m > 0:
-            self.solid_angle_fraction = gegi_solid_angle_fraction(self.source_distance_m)
+            self.solid_angle_fraction = gegi_solid_angle_fraction(
+                self.source_distance_m, self.crystal_radius_m)
         else:
             self.solid_angle_fraction = 0.0
+
+    def _total_plates(self):
+        """Total steel plates in the beam = permanent mounted plates + operator
+        plates. Distance and attenuation both scale with this."""
+        return self.base_shield_plates + self.n_shielding_plates
+
+    def _recompute_distance_from_plates(self):
+        """Derive standoff from the number of in-line shielding plates.
+
+        source_distance_m = base_standoff_m + total_plates * plate_thickness_m,
+        where total_plates includes the permanently-mounted base_shield_plates.
+        Only applies when shielding geometry is configured (plate thickness and
+        base standoff > 0); otherwise the static source_distance_m is kept.
+        """
+        if self.plate_thickness_m > 0 and self.base_standoff_m > 0:
+            self.source_distance_m = (
+                self.base_standoff_m
+                + self._total_plates() * self.plate_thickness_m)
+
+    def _publish_distance(self):
+        """Broadcast the effective source distance to dose/imaging consumers."""
+        try:
+            self.pub_distance.publish(Float64(data=self.source_distance_m))
+        except Exception:
+            pass
+
+    def _shield_transmission(self, iso):
+        """Fraction of this isotope's gammas transmitted through the plates."""
+        total_thickness = self._total_plates() * self.plate_thickness_m
+        if total_thickness <= 0 or iso.mu_shield_per_m <= 0:
+            return 1.0
+        return math.exp(-iso.mu_shield_per_m * total_thickness)
 
     def _on_distance(self, msg):
         """Callback for dynamic distance updates (std_msgs/Float64, metres)."""
@@ -238,7 +311,22 @@ class ActivityNode(object):
         if new_dist > 0 and abs(new_dist - self.source_distance_m) > 0.001:
             self.source_distance_m = new_dist
             self._update_solid_angle()
+            self._publish_distance()
             rospy.loginfo("Activity node: distance updated to %.3fm -> solid_angle=%.6f",
+                          self.source_distance_m, self.solid_angle_fraction)
+
+    def _on_n_plates(self, msg):
+        """Callback: operator sets the number of in-line shielding plates."""
+        n = int(msg.data)
+        if n < 0:
+            return
+        if n != self.n_shielding_plates:
+            self.n_shielding_plates = n
+            self._recompute_distance_from_plates()
+            self._update_solid_angle()
+            self._publish_distance()
+            rospy.loginfo("Activity node: %d shielding plate(s) -> distance=%.3fm, "
+                          "solid_angle=%.6f", self.n_shielding_plates,
                           self.source_distance_m, self.solid_angle_fraction)
 
     def _on_spectrum(self, msg):
@@ -417,22 +505,26 @@ class ActivityNode(object):
         #   - Derived from empirical calibration at calibration_distance (most accurate)
         #   - From PHDS polynomial (theoretical fallback)
         # This approach works at ANY distance without recalibration.
+        # In-line shielding attenuates the measured signal; divide by the
+        # transmission to recover the true activity (energy-dependent).
+        transmission = self._shield_transmission(iso)
+
         activity_Bq = 0.0
         epsilon_used = 0.0
         method_used = 'none'
         if net_corrected > 0 and valid:
             if iso.intrinsic_efficiency > 0 and self.solid_angle_fraction > 0:
-                # First principles: A = N_net / (eps_intrinsic * Omega/(4pi) * I_gamma * t_live)
+                # First principles: A = N_net / (eps_intrinsic * Omega/(4pi) * I_gamma * t_live * T)
                 epsilon_abs = iso.intrinsic_efficiency * self.solid_angle_fraction
                 epsilon_used = epsilon_abs
                 activity_Bq = net_corrected / (
-                    epsilon_abs * iso.emission_probability * live_time_s)
+                    epsilon_abs * iso.emission_probability * live_time_s * transmission)
                 method_used = 'intrinsic_efficiency'
             elif iso.efficiency > 0 and iso.emission_probability > 0:
                 # Manual absolute efficiency override (legacy)
                 epsilon_used = iso.efficiency
                 activity_Bq = net_corrected / (
-                    iso.efficiency * iso.emission_probability * live_time_s)
+                    iso.efficiency * iso.emission_probability * live_time_s * transmission)
                 method_used = 'manual_efficiency'
             else:
                 activity_Bq = 0.0
@@ -453,6 +545,9 @@ class ActivityNode(object):
             'solid_angle_fraction': self.solid_angle_fraction,
             'absolute_efficiency': iso.intrinsic_efficiency * self.solid_angle_fraction,
             'source_distance_m': self.source_distance_m,
+            'n_shielding_plates': self.n_shielding_plates,
+            'total_shield_plates': self._total_plates(),
+            'shield_transmission': transmission,
             'method': method_used,
             'gross_counts': gross,
             'background_counts': background,

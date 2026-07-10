@@ -19,12 +19,14 @@ from collections import deque
 import numpy as np
 import rospy
 import struct
+import yaml
 from geometry_msgs.msg import PoseStamped, PoseArray, Pose
 from radiation_detector_msgs.msg import ComptonEvent
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger, TriggerResponse
 from std_msgs.msg import String
+from std_msgs.msg import Float64
 
 # Known isotope photo-peak energies (keV) and identification windows
 ISOTOPE_PEAKS = {
@@ -32,11 +34,50 @@ ISOTOPE_PEAKS = {
     'Co-60':  {'energy': 1252, 'window': 200},  # avg of 1173+1332, wide window covers both
 }
 
-# Specific gamma-ray dose rate constants (uSv*m^2 / MBq*h)
-GAMMA_CONSTANTS = {
+# Specific gamma-ray dose-rate constants (uSv*m^2 / MBq*h). The authoritative
+# values live in config/isotopes.yaml under `gamma_constants`; this dict is only
+# the fallback used when that file is missing or lacks the section.
+DEFAULT_GAMMA_CONSTANTS = {
     'Cs-137': 0.0771,
     'Co-60':  0.3059,
 }
+
+
+def _norm_iso(name):
+    """Normalise an isotope name for lookup: uppercase, drop punctuation.
+    So 'Cs137', 'Cs-137', 'cs_137' and 'Co60_1173' all collapse sensibly."""
+    return ''.join(ch for ch in str(name).upper() if ch.isalnum())
+
+
+def load_gamma_constants(config_path):
+    """Load specific gamma-ray dose-rate constants from isotopes.yaml.
+
+    Returns a dict keyed by the normalised isotope name so lookups work whether
+    the caller passes the yaml form ('Cs137') or the display form ('Cs-137').
+    Falls back to DEFAULT_GAMMA_CONSTANTS if the file is missing/unreadable.
+    """
+    table = {_norm_iso(k): float(v) for k, v in DEFAULT_GAMMA_CONSTANTS.items()}
+    if config_path and os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            for k, v in (cfg.get('gamma_constants', {}) or {}).items():
+                table[_norm_iso(k)] = float(v)
+        except Exception as exc:  # noqa: broad - never let dose weighting crash
+            rospy.logwarn("Could not load gamma_constants from %s: %s",
+                          config_path, exc)
+    return table
+
+
+def gamma_constant_for(table, iso_name, default=0.077):
+    """Look up a gamma constant tolerant of naming ('Co-60' vs 'Co60_1173')."""
+    key = _norm_iso(iso_name)
+    if key in table:
+        return table[key]
+    for k, v in table.items():
+        if key.startswith(k) or k.startswith(key):
+            return v
+    return default
 
 
 def identify_isotope(energies_kev):
@@ -72,19 +113,55 @@ def fibonacci_sphere(n_points):
 
 class SphericalHeatmapNode(object):
     def __init__(self):
+        # Dose-rate gamma constants, single-sourced from isotopes.yaml.
+        self.isotopes_config = rospy.get_param("~isotopes_config", "")
+        self.gamma_constants = load_gamma_constants(self.isotopes_config)
+
         self.radius = rospy.get_param("~radius", 0.5)  # 1m diameter
         self.n_points = int(rospy.get_param("~n_points", 8000))
         self.window_s = rospy.get_param("~window_s", 180.0)
         self.update_period_s = rospy.get_param("~update_period_s", 2.0)
         self.min_events = int(rospy.get_param("~min_events", 50))
-        self.max_events = int(rospy.get_param("~max_events", 3000))
+        # Cap on events fed to the live back-projection. Raised so the live image
+        # uses far more of the stream (the raw bag already keeps every event).
+        # Cost is O(max_events x n_points) per update; lower it if updates lag.
+        self.max_events = int(rospy.get_param("~max_events", 20000))
         self.sigma_floor = rospy.get_param("~sigma_floor", 0.04)
         self.max_uncertainty = rospy.get_param("~max_uncertainty", 0.15)
         self.hemisphere_only = rospy.get_param("~hemisphere_only", True)
         self.max_peaks = int(rospy.get_param("~max_peaks", 5))
         self.peak_min_separation_deg = rospy.get_param("~peak_min_separation_deg", 25.0)
-        self.peak_threshold = rospy.get_param("~peak_threshold", 0.75)  # fraction of max score
+        # Fraction of the strongest peak a secondary source must reach to be
+        # reported. Off-axis sources back-project weaker than on-axis ones (lower
+        # detection efficiency), so a high gate (0.75) makes similar-activity
+        # off-axis sources flicker in/out around the threshold. 0.5 keeps genuine
+        # multi-source scenes stable while still rejecting noise ridges.
+        self.peak_threshold = rospy.get_param("~peak_threshold", 0.5)  # fraction of max score
         self.refine_peaks = rospy.get_param("~refine_peaks", True)
+        # Temporal persistence: report a candidate peak only if a same-isotope
+        # peak appeared within peak_persist_tol_deg in at least peak_persist_min
+        # of the last peak_persist_frames frames (including the current one).
+        # Stable real sources pass immediately; flickering ghost peaks from
+        # Compton cone cross-talk are rejected. Set peak_persist_min <= 1 to
+        # disable. Costs (peak_persist_min - 1) frames of latency for new sources.
+        self.peak_persist_frames = int(rospy.get_param("~peak_persist_frames", 4))
+        self.peak_persist_min = int(rospy.get_param("~peak_persist_min", 2))
+        self.peak_persist_tol_deg = rospy.get_param("~peak_persist_tol_deg", 8.0)
+        self._peak_history = deque(maxlen=max(1, self.peak_persist_frames))
+        # Ghost suppression (default: support-based rejection). For each candidate
+        # peak, count the events whose Compton cones actually pass through it. A
+        # real source is on the cones of all its own events; a cone-crossing ghost
+        # sits only on coincidental crossings, so its support is far lower. A peak
+        # is kept only if its support >= max(min_source_events, support_ratio *
+        # strongest peak's support). This uses no event removal / re-solving, so
+        # it cannot create new artifacts. Raise support_ratio to reject more
+        # ghosts; lower it to keep weaker real sources.
+        self.support_ratio = rospy.get_param("~support_ratio", 0.5)
+        self.min_source_events = int(rospy.get_param("~min_source_events", 15))
+        self.attribution_tol_deg = rospy.get_param("~attribution_tol_deg", 6.0)
+        # Optional alternative: CLEAN-style iterative extraction (off by default;
+        # can over-produce peaks with strong multi-source scenes).
+        self.iterative_extraction = rospy.get_param("~iterative_extraction", False)
 
         # Build sphere grid
         all_pts = fibonacci_sphere(self.n_points * (1 if not self.hemisphere_only else 2))
@@ -105,7 +182,7 @@ class SphericalHeatmapNode(object):
         self.raster_cell_m = rospy.get_param("~raster_cell_m", 0.005)  # 5mm cells
         self.raster_fov_m = rospy.get_param("~raster_fov_m", 0.5)  # +/-0.5m coverage
 
-        self.sub = rospy.Subscriber("/compton_event", ComptonEvent, self.on_event, queue_size=600)
+        self.sub = rospy.Subscriber("/compton_event", ComptonEvent, self.on_event, queue_size=10000)
         self.pub_cloud = rospy.Publisher("/sphere_heatmap", PointCloud2, queue_size=2)
         self.pub_peak = rospy.Publisher("/source_direction", PoseStamped, queue_size=2)
         self.pub_peaks = rospy.Publisher("/source_directions", PoseArray, queue_size=2)
@@ -118,8 +195,22 @@ class SphericalHeatmapNode(object):
         self._dose_rate_uSv_h = {}  # isotope display name -> dose rate in uSv/h
         self.sub_activity = rospy.Subscriber(
             "/activity/results", String, self._on_activity, queue_size=5)
+        # Track the plate-derived source distance so the imaging sphere and dose
+        # scaling follow the shielding standoff set on the activity node.
+        self.sub_distance = rospy.Subscriber(
+            "/activity/effective_source_distance", Float64,
+            self._on_source_distance, queue_size=2)
 
         self.timer = rospy.Timer(rospy.Duration(self.update_period_s), self.on_timer)
+
+    def _on_source_distance(self, msg):
+        """Update sphere radius / dose standoff from the plate-derived distance."""
+        d = float(msg.data)
+        if d > 0 and abs(d - self.radius) > 1e-4:
+            with self.lock:
+                self.radius = d
+                self.sphere_points = self.directions * self.radius
+            rospy.loginfo("Sphere heatmap: source distance -> %.3fm", d)
 
     def _handle_clear(self, req):
         with self.lock:
@@ -150,7 +241,7 @@ class SphericalHeatmapNode(object):
                 else:
                     activities[display] = activity_mbq
             for display, a_mbq in activities.items():
-                gamma = GAMMA_CONSTANTS.get(display, 0.077)
+                gamma = gamma_constant_for(self.gamma_constants, display)
                 dose_rates[display] = gamma * a_mbq / (d * d) if d > 0 else 0.0
             with self.lock:
                 self._dose_rate_uSv_h = dose_rates
@@ -195,6 +286,20 @@ class SphericalHeatmapNode(object):
             ang_dev = np.abs(actual_angle - angle)
             scores += np.exp(-0.5 * (ang_dev / self.sigma_floor) ** 2)
 
+        return scores
+
+    def _solve_events(self, band_events):
+        """Back-project a pre-filtered list of (apex, axis, angle) tuples."""
+        points = self.sphere_points
+        scores = np.zeros(points.shape[0], dtype=np.float64)
+        for apex, axis, angle in band_events:
+            ap = points - apex
+            ap_norm = np.linalg.norm(ap, axis=1)
+            cos_actual = np.dot(ap, axis) / np.maximum(ap_norm, 1e-9)
+            cos_actual = np.clip(cos_actual, -1.0, 1.0)
+            actual_angle = np.arccos(cos_actual)
+            ang_dev = np.abs(actual_angle - angle)
+            scores += np.exp(-0.5 * (ang_dev / self.sigma_floor) ** 2)
         return scores
 
     def _solve_energy_filtered(self, events, energy_center, energy_window):
@@ -306,12 +411,14 @@ class SphericalHeatmapNode(object):
             if not self._is_local_maximum(int(idx), scores):
                 continue
 
-            # Secondary peaks must score at least threshold * primary
+            # Secondary peaks must score at least threshold * primary.
+            # Use continue (not break) so one sub-threshold candidate does not
+            # abort the search for other valid, well-separated peaks.
             if peaks:
                 primary_norm = (scores[peaks[0]] - min_score) / score_range
                 this_norm = (scores[idx] - min_score) / score_range
                 if this_norm < self.peak_threshold * primary_norm:
-                    break
+                    continue
 
             # Check angular separation from existing peaks
             too_close = False
@@ -327,6 +434,111 @@ class SphericalHeatmapNode(object):
                 peaks.append(int(idx))
 
         return peaks
+
+    def _events_on_direction_mask(self, band_events, direction, tol_rad):
+        """Boolean mask of events whose Compton cone passes within tol_rad of direction."""
+        target = self.radius * direction
+        mask = np.zeros(len(band_events), dtype=bool)
+        for i, (apex, axis, angle) in enumerate(band_events):
+            vec = target - apex
+            vn = np.linalg.norm(vec)
+            if vn < 1e-9:
+                continue
+            cos_actual = np.clip(np.dot(vec / vn, axis), -1.0, 1.0)
+            if abs(np.arccos(cos_actual) - angle) < tol_rad:
+                mask[i] = True
+        return mask
+
+    def _filter_peaks_by_support(self, peak_indices, scores, band_events):
+        """Reject cone-crossing ghost peaks by event support, then refine.
+
+        A real source lies on the cones of all its own events; a ghost sits only
+        on coincidental crossings from other sources, so its support is far lower.
+        Keep a peak if its support >= max(min_source_events, support_ratio *
+        strongest peak's support). Returns refined positions of the kept peaks.
+        """
+        if not peak_indices:
+            return []
+        attr_tol = np.radians(self.attribution_tol_deg)
+        supports = []
+        for pidx in peak_indices:
+            mask = self._events_on_direction_mask(
+                band_events, self.directions[pidx], attr_tol)
+            supports.append(int(np.count_nonzero(mask)))
+        max_support = max(supports) if supports else 0
+        floor = max(self.min_source_events, int(self.support_ratio * max_support))
+        positions = []
+        for pidx, sup in zip(peak_indices, supports):
+            if sup >= floor:
+                positions.append(
+                    self._refine_peak_centroid(pidx, scores)
+                    if self.refine_peaks else self.sphere_points[pidx])
+        return positions
+
+    def _extract_peaks_iterative(self, events, energy_center, energy_window):
+        """CLEAN-style iterative source extraction for one isotope band.
+
+        Repeatedly: back-project the remaining events, take the strongest
+        well-separated local maximum, and if enough events' cones actually pass
+        through it (>= min_source_events), record it and remove those events.
+        Removing a real source's events collapses ghost peaks built from them.
+
+        Returns (list_of_refined_positions, band_event_count).
+        """
+        band = [(apex, axis, angle)
+                for (_, apex, axis, angle, energy) in events
+                if energy_center - energy_window < energy < energy_center + energy_window]
+        band_count = len(band)
+        if band_count < self.min_source_events:
+            return [], band_count
+
+        min_sep_rad = np.radians(self.peak_min_separation_deg)
+        attr_tol = np.radians(self.attribution_tol_deg)
+        remaining = band
+        found_positions = []
+        found_idx = []
+
+        for _ in range(self.max_peaks):
+            if len(remaining) < self.min_source_events:
+                break
+            scores = self._solve_events(remaining)
+            if scores.max() <= 0.0:
+                break
+
+            # Strongest local maximum not too close to an already-found source.
+            cand_idx = None
+            for idx in np.argsort(scores)[::-1]:
+                idx = int(idx)
+                if not self._is_local_maximum(idx, scores):
+                    continue
+                too_close = False
+                for p in found_idx:
+                    cs = np.clip(np.dot(self.directions[idx], self.directions[p]), -1.0, 1.0)
+                    if np.arccos(cs) < min_sep_rad:
+                        too_close = True
+                        break
+                if not too_close:
+                    cand_idx = idx
+                    break
+            if cand_idx is None:
+                break
+
+            mask = self._events_on_direction_mask(
+                remaining, self.directions[cand_idx], attr_tol)
+            support = int(np.count_nonzero(mask))
+            if support < self.min_source_events:
+                break  # residual peak is a ghost/noise, not a real source
+
+            if self.refine_peaks:
+                refined_pos = self._refine_peak_centroid(cand_idx, scores)
+            else:
+                refined_pos = self.sphere_points[cand_idx]
+            found_positions.append(np.asarray(refined_pos, dtype=np.float64))
+            found_idx.append(cand_idx)
+
+            remaining = [e for e, m in zip(remaining, mask) if not m]
+
+        return found_positions, band_count
 
     def _refine_peak_centroid(self, peak_idx, scores, radius_rad=0.04):
         """Refine peak location using score-weighted centroid of nearby points.
@@ -364,6 +576,38 @@ class SphericalHeatmapNode(object):
         centroid_dir /= norm
         return centroid_dir * self.radius
 
+    def _apply_peak_persistence(self, candidates):
+        """Reject flickering ghost peaks via temporal persistence.
+
+        Keep a candidate only if a same-isotope peak appeared within
+        peak_persist_tol_deg in at least peak_persist_min of the last
+        peak_persist_frames frames (including the current one). This frame's raw
+        candidates are always recorded for future frames, whether or not they
+        are confirmed now.
+        """
+        current = [{'iso': c['iso'], 'unit': c['unit']} for c in candidates]
+
+        if self.peak_persist_min <= 1:
+            self._peak_history.append(current)
+            return candidates
+
+        cos_tol = np.cos(np.radians(self.peak_persist_tol_deg))
+        history = list(self._peak_history)  # previous frames only
+
+        confirmed = []
+        for c in candidates:
+            matches = 1  # current frame counts
+            for frame in history:
+                for h in frame:
+                    if h['iso'] == c['iso'] and float(np.dot(h['unit'], c['unit'])) >= cos_tol:
+                        matches += 1
+                        break
+            if matches >= self.peak_persist_min:
+                confirmed.append(c)
+
+        self._peak_history.append(current)
+        return confirmed
+
     def on_timer(self, _event):
         now = rospy.Time.now()
         with self.lock:
@@ -398,27 +642,34 @@ class SphericalHeatmapNode(object):
         peak_msg.pose.orientation.w = 1.0
         self.pub_peak.publish(peak_msg)
 
-        # Publish all detected peaks as PoseArray - find peaks per isotope energy band
-        peaks_msg = PoseArray()
-        peaks_msg.header.stamp = now
-        peaks_msg.header.frame_id = "detector"
-        isotope_labels = []
-
+        # Find peaks per isotope energy band. Collect raw candidates first, then
+        # apply temporal persistence to drop flickering ghost peaks before publish.
+        raw_candidates = []
         for iso_name, iso_info in ISOTOPE_PEAKS.items():
-            iso_scores, iso_count = self._solve_energy_filtered(
-                events, iso_info['energy'], iso_info['window'])
+            # Band-filter this isotope's events once.
+            e_lo = iso_info['energy'] - iso_info['window']
+            e_hi = iso_info['energy'] + iso_info['window']
+            band = [(apex, axis, angle)
+                    for (_, apex, axis, angle, energy) in events
+                    if e_lo < energy < e_hi]
+            iso_count = len(band)
             if iso_count < 5:
                 continue
-            iso_peaks = self._find_peaks(iso_scores)
-            if not iso_peaks:
+
+            if self.iterative_extraction:
+                positions, _ = self._extract_peaks_iterative(
+                    events, iso_info['energy'], iso_info['window'])
+            else:
+                iso_scores = self._solve_events(band)
+                positions = self._filter_peaks_by_support(
+                    self._find_peaks(iso_scores), iso_scores, band)
+            if not positions:
                 continue
-            # Report ALL detected peaks for this isotope (supports multiple same-isotope sources)
-            for pidx in iso_peaks:
-                # Refine peak location using score-weighted centroid
-                if self.refine_peaks:
-                    refined_pos = self._refine_peak_centroid(pidx, iso_scores)
-                else:
-                    refined_pos = self.sphere_points[pidx]
+            # ALL detected peaks for this isotope (supports multiple same-isotope sources)
+            for refined_pos in positions:
+                refined_pos = np.asarray(refined_pos, dtype=np.float64)
+                pos_norm = np.linalg.norm(refined_pos)
+                unit = refined_pos / pos_norm if pos_norm > 1e-9 else refined_pos
                 # Convert sphere position to real-world coordinate at source plane
                 # Y_real = distance * Y_sphere / X_sphere (ray-plane intersection)
                 x_s = float(refined_pos[0])
@@ -430,13 +681,24 @@ class SphericalHeatmapNode(object):
                 else:
                     y_real = y_s
                     z_real = z_s
-                p = Pose()
-                p.position.x = self.radius  # source distance along X
-                p.position.y = y_real
-                p.position.z = z_real
-                p.orientation.w = 1.0
-                peaks_msg.poses.append(p)
-                isotope_labels.append("{}:{}".format(iso_name, iso_count))
+                raw_candidates.append({
+                    'iso': iso_name, 'count': iso_count,
+                    'unit': unit, 'y': y_real, 'z': z_real})
+
+        confirmed_peaks = self._apply_peak_persistence(raw_candidates)
+
+        peaks_msg = PoseArray()
+        peaks_msg.header.stamp = now
+        peaks_msg.header.frame_id = "detector"
+        isotope_labels = []
+        for c in confirmed_peaks:
+            p = Pose()
+            p.position.x = self.radius  # source distance along X
+            p.position.y = c['y']
+            p.position.z = c['z']
+            p.orientation.w = 1.0
+            peaks_msg.poses.append(p)
+            isotope_labels.append("{}:{}".format(c['iso'], c['count']))
 
         self.pub_peaks.publish(peaks_msg)
 
@@ -472,7 +734,7 @@ class SphericalHeatmapNode(object):
                     iso_norm_scores[iso_name] = normed * dr
                 else:
                     # Fallback: use gamma constant as relative weight
-                    gamma = GAMMA_CONSTANTS.get(iso_name, 0.077)
+                    gamma = gamma_constant_for(self.gamma_constants, iso_name)
                     iso_norm_scores[iso_name] = normed * gamma
             else:
                 iso_norm_scores[iso_name] = np.zeros_like(scores)

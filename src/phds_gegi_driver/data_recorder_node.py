@@ -33,6 +33,7 @@ from datetime import datetime
 import numpy as np
 import rospy
 import rosbag
+import yaml
 from std_msgs.msg import Float64, String
 from geometry_msgs.msg import PoseArray
 from sensor_msgs.msg import PointCloud2
@@ -40,13 +41,69 @@ from radiation_detector_msgs.msg import ComptonEvent, Spectrum
 from phds_gegi_driver.srv import StartTimedAcquisition, StartTimedAcquisitionRequest, GetRunInfo
 
 
+# Specific gamma-ray dose-rate constants (uSv*m^2 / MBq*h). The authoritative
+# values live in config/isotopes.yaml under `gamma_constants`; this dict is only
+# the fallback used when that file is missing or lacks the section.
+DEFAULT_GAMMA_CONSTANTS = {'Cs-137': 0.0771, 'Co-60': 0.3059}
+
+
+def _norm_iso(name):
+    """Normalise an isotope name for lookup: uppercase, drop punctuation.
+    So 'Cs137', 'Cs-137', 'cs_137' and 'Co60_1173' all collapse sensibly."""
+    return ''.join(ch for ch in str(name).upper() if ch.isalnum())
+
+
+def load_gamma_constants(config_path):
+    """Load specific gamma-ray dose-rate constants from isotopes.yaml.
+
+    Returns a dict keyed by the normalised isotope name so lookups work whether
+    the caller passes the yaml form ('Cs137') or the display form ('Cs-137').
+    Falls back to DEFAULT_GAMMA_CONSTANTS if the file is missing/unreadable so
+    dose weighting never hard-fails on a config problem.
+    """
+    table = {_norm_iso(k): float(v) for k, v in DEFAULT_GAMMA_CONSTANTS.items()}
+    if config_path and os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            for k, v in (cfg.get('gamma_constants', {}) or {}).items():
+                table[_norm_iso(k)] = float(v)
+        except Exception as exc:  # noqa: broad - never let dose weighting crash
+            rospy.logwarn("Could not load gamma_constants from %s: %s",
+                          config_path, exc)
+    return table
+
+
+def gamma_constant_for(table, iso_name, default=0.077):
+    """Look up a gamma constant tolerant of naming ('Co-60' vs 'Co60_1173')."""
+    key = _norm_iso(iso_name)
+    if key in table:
+        return table[key]
+    # Fall back to a prefix match (e.g. 'CO601173' -> 'CO60').
+    for k, v in table.items():
+        if key.startswith(k) or k.startswith(key):
+            return v
+    return default
+
+
 class DataRecorderNode(object):
     def __init__(self):
         self.output_dir = rospy.get_param("~output_dir", "/opt/phds_gegi_driver/data")
         cal_path = rospy.get_param("~calibration_file", "")
+        self.calibration_file = cal_path
+        self.isotopes_config = rospy.get_param("~isotopes_config", "")
         self.source_distance_m = rospy.get_param("~source_distance_m", 0.5)
         self.heatmap_grid_res = rospy.get_param("~heatmap_grid_res", 200)
         self.run_info_settle_s = rospy.get_param("~run_info_settle_s", 15.0)
+        # How often to poll detector run-info WHILE recording, so the true
+        # dead-time is captured during acquisition (a post-stop query fails once
+        # the detector has stopped/reset). Each poll briefly shares the detector
+        # socket and drops a few events, so keep this coarse.
+        self.run_info_poll_s = rospy.get_param("~run_info_poll_s", 30.0)
+        # Prefix for the durable measurement identifier written into every asset
+        # so the database can link the N42, activity peak rows and heatmaps of a
+        # run back to one parent Measurement (spec DB-GEGI-002 / DB-GEGI-004).
+        self.measurement_id_prefix = rospy.get_param("~measurement_id_prefix", "GEGI")
 
         # Ensure output dir exists
         if not os.path.exists(self.output_dir):
@@ -54,6 +111,9 @@ class DataRecorderNode(object):
 
         # Load energy calibration for N42 export
         self.bin_edges = self._load_energy_cal(cal_path)
+
+        # Dose-rate gamma constants, single-sourced from isotopes.yaml.
+        self.gamma_constants = load_gamma_constants(self.isotopes_config)
 
         # Recording state
         self.lock = threading.Lock()
@@ -68,6 +128,11 @@ class DataRecorderNode(object):
         self.recording_start = None
         self.duration_minutes = 0
         self.timer = None
+        self.measurement_id = ""
+        self.reference_datetime = ""
+        # Latest valid detector run-info captured during the active recording.
+        self._last_run_info = self._empty_run_info()
+        self._run_info_lock = threading.Lock()
 
         # Proxy service: user calls this instead of /detector/start_timed_acquisition
         self.record_srv = rospy.Service(
@@ -91,7 +156,7 @@ class DataRecorderNode(object):
 
         # Subscribers (always active, but only record when self.recording=True)
         self.sub_compton = rospy.Subscriber(
-            "/compton_event", ComptonEvent, self._on_compton, queue_size=500)
+            "/compton_event", ComptonEvent, self._on_compton, queue_size=10000)
         self.sub_spectrum = rospy.Subscriber(
             "/spectrum", Spectrum, self._on_spectrum, queue_size=10)
         self.sub_peaks = rospy.Subscriber(
@@ -102,11 +167,23 @@ class DataRecorderNode(object):
             "/activity/results", String, self._on_activity, queue_size=5)
         self.sub_cloud = rospy.Subscriber(
             "/sphere_heatmap", PointCloud2, self._on_cloud, queue_size=2)
+        # Track the effective source distance (base standoff + shielding plates)
+        # published by the activity node, so saved dose/imaging use the same
+        # geometry as the activity estimate.
+        self.sub_distance = rospy.Subscriber(
+            "/activity/effective_source_distance", Float64,
+            self._on_source_distance, queue_size=2)
 
         # Latest isotope text for pairing with peaks
         self._latest_isotope_text = ""
         # Latest activity per isotope (name -> MBq)
         self._latest_activity_MBq = {}
+
+        # NOTE: we deliberately do NOT poll run-info during recording. Every
+        # get_run_info call reads and discards a slice of the shared event stream
+        # (see _query_run_info_once), which would make the recorded spectrum/
+        # heatmap unfaithful to the detector. Instead a single query is taken at
+        # stop (_stop_recording), before the acquisition flag is cleared.
 
         rospy.loginfo("Data recorder node ready. Output dir: %s", self.output_dir)
 
@@ -211,8 +288,12 @@ class DataRecorderNode(object):
         return TriggerResponse(success=all_ok, message=message)
 
     def _start_recording(self, duration_minutes):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        start_dt = datetime.now()
+        timestamp = start_dt.strftime("%Y%m%d_%H%M%S")
         bag_path = os.path.join(self.output_dir, "{}_compton_events.bag".format(timestamp))
+
+        with self._run_info_lock:
+            self._last_run_info = self._empty_run_info()
 
         with self.lock:
             self.recording = True
@@ -225,6 +306,11 @@ class DataRecorderNode(object):
             self.heatmap_cloud = None
             self.activity_results = []
             self._timestamp_prefix = timestamp
+            # Durable measurement identity, stamped into every asset of this run.
+            self.measurement_id = "{}-{}".format(self.measurement_id_prefix, timestamp)
+            # ISO-8601 acquisition reference time (spec DB-ACT-003: activity
+            # without a reference date/time is not durable).
+            self.reference_datetime = start_dt.isoformat()
             self.bag = rosbag.Bag(bag_path, 'w')
 
         rospy.loginfo("Recording started: %d min, bag=%s", duration_minutes, bag_path)
@@ -239,15 +325,23 @@ class DataRecorderNode(object):
         """Called when the timed acquisition ends. Save all files."""
         rospy.loginfo("Timed acquisition complete. Saving data files...")
 
+        # Single run-info query while the detector is (usually) still acquiring.
+        # We do this ONCE per run rather than polling: each query consumes and
+        # discards a slice of the shared event stream, so one query keeps the
+        # recorded spectrum/heatmap faithful. Cached for the activity CSV below.
+        pre_stop_info = self._query_run_info_once()
+        if pre_stop_info['valid'] and pre_stop_info['real_time_sec'] > 0.0:
+            with self._run_info_lock:
+                self._last_run_info = pre_stop_info
+
         # Keep recording flag on briefly to capture any final heatmap/activity publishes
         # The heatmap node publishes every ~2s; wait one cycle to get final state.
         rospy.sleep(3.0)
 
-        # Get detector-reported run info once the stream settles. This is the
-        # most reliable path for the true dead-time value when run-info parsing
-        # may be intermittent during active streaming.
-        detector_run_info = self._fetch_detector_run_info_post_stop()
-
+        # Stop recording and snapshot totals NOW, BEFORE the run-info settle/fetch.
+        # Otherwise the ~15-30 s spent settling and querying detector run-info would
+        # keep accumulating into total_real_time_ms/total_live_time_ms and inflate
+        # the reported run duration (e.g. 5 min -> ~338 s).
         with self.lock:
             self.recording = False
             bag = self.bag
@@ -259,6 +353,13 @@ class DataRecorderNode(object):
             cloud = self.heatmap_cloud
             activities = list(self.activity_results)
             prefix = self._timestamp_prefix
+            measurement_id = self.measurement_id
+            reference_datetime = self.reference_datetime
+            duration_minutes = self.duration_minutes
+
+        # Get detector-reported run info once the stream settles (acquisition is
+        # already flagged stopped, so this no longer inflates the run totals).
+        detector_run_info = self._fetch_detector_run_info_post_stop()
 
         # Close bag file
         if bag:
@@ -266,7 +367,8 @@ class DataRecorderNode(object):
             rospy.loginfo("  Bag saved: %s_compton_events.bag", prefix)
 
         # Save spectrum as N42
-        self._save_n42(prefix, spectrum, real_time_ms, live_time_ms)
+        self._save_n42(prefix, spectrum, real_time_ms, live_time_ms,
+                       measurement_id, reference_datetime)
 
         # Save heatmap raw points CSV (irregular, per-isotope scores)
         try:
@@ -289,51 +391,68 @@ class DataRecorderNode(object):
         # Save activity results as CSV
         try:
             self._save_activity_csv(prefix, activities, detector_run_info,
-                                    real_time_ms, live_time_ms)
+                                    real_time_ms, live_time_ms,
+                                    measurement_id, reference_datetime)
         except Exception as e:
             rospy.logerr("Failed to save activity CSV: %s", e)
 
-        rospy.loginfo("All data files saved with prefix: %s", prefix)
-
-    def _fetch_detector_run_info_post_stop(self):
-        """Fetch detector run info after acquisition stop with settle delay."""
-        info = {
-            'valid': False,
-            'dead_time_percent': 0.0,
-            'real_time_sec': 0.0,
-            'live_time_sec': 0.0,
-            'message': 'not_queried'
-        }
-
-        settle = max(0.0, float(self.run_info_settle_s))
-        if settle > 0:
-            rospy.sleep(settle)
-
+        # Save the run manifest that links every asset to one parent Measurement
+        # (spec DB-GEGI-002 / DB-GEGI-004).
         try:
-            rospy.wait_for_service('/detector/get_run_info', timeout=5.0)
+            self._save_manifest(prefix, measurement_id, reference_datetime,
+                                duration_minutes, real_time_ms, live_time_ms,
+                                detector_run_info, activities)
+        except Exception as e:
+            rospy.logerr("Failed to save run manifest: %s", e)
+
+        rospy.loginfo("All data files saved with prefix: %s (measurement_id=%s)",
+                      prefix, measurement_id)
+
+    @staticmethod
+    def _empty_run_info():
+        return {'valid': False, 'dead_time_percent': 0.0, 'real_time_sec': 0.0,
+                'live_time_sec': 0.0, 'message': 'not_queried'}
+
+    def _query_run_info_once(self):
+        """Single, non-blocking-ish query of /detector/get_run_info."""
+        info = self._empty_run_info()
+        try:
+            rospy.wait_for_service('/detector/get_run_info', timeout=2.0)
             proxy = rospy.ServiceProxy('/detector/get_run_info', GetRunInfo)
-            for _ in range(3):
-                resp = proxy()
-                if resp.success:
-                    info['valid'] = True
-                    info['dead_time_percent'] = float(resp.dead_time_percent)
-                    info['real_time_sec'] = float(resp.real_time_sec)
-                    info['live_time_sec'] = float(resp.live_time_sec)
-                    info['message'] = resp.message
-                    break
-                info['message'] = resp.message
-                rospy.sleep(1.0)
+            resp = proxy()
+            info['message'] = resp.message
+            if resp.success:
+                info['valid'] = True
+                info['dead_time_percent'] = float(resp.dead_time_percent)
+                info['real_time_sec'] = float(resp.real_time_sec)
+                info['live_time_sec'] = float(resp.live_time_sec)
         except Exception as e:
             info['message'] = str(e)
-
-        if info['valid']:
-            rospy.loginfo("  Detector run info: real=%.3fs live=%.3fs dead=%.3f%%",
-                          info['real_time_sec'], info['live_time_sec'],
-                          info['dead_time_percent'])
-        else:
-            rospy.logwarn("  Detector run info unavailable: %s", info['message'])
-
         return info
+
+    def _fetch_detector_run_info_post_stop(self):
+        """Return the run-info captured by the single pre-stop query.
+
+        We do NOT query again here: the detector often resets to idle on stop
+        (returning zeros), and every query discards event-stream data. The
+        pre-stop query in _stop_recording is the one and only read for the run.
+        """
+        with self._run_info_lock:
+            stored = dict(self._last_run_info)
+        if stored.get('valid') and stored.get('real_time_sec', 0.0) > 0.0:
+            rospy.loginfo("  Detector run info: real=%.3fs live=%.3fs dead=%.3f%%",
+                          stored['real_time_sec'], stored['live_time_sec'],
+                          stored['dead_time_percent'])
+            return stored
+
+        rospy.logwarn("  Detector run info unavailable for this run")
+        return self._empty_run_info()
+
+    def _on_source_distance(self, msg):
+        """Track the plate-derived source distance for dose/imaging outputs."""
+        if msg.data > 0 and abs(msg.data - self.source_distance_m) > 1e-4:
+            self.source_distance_m = float(msg.data)
+            rospy.loginfo("Data recorder: source distance -> %.3fm", self.source_distance_m)
 
     def _on_compton(self, msg):
         with self.lock:
@@ -442,8 +561,13 @@ class DataRecorderNode(object):
             except (ValueError, TypeError):
                 pass
 
-    def _save_n42(self, prefix, spectrum, real_time_ms, live_time_ms):
-        """Save spectrum in ANSI N42.42 XML format."""
+    def _save_n42(self, prefix, spectrum, real_time_ms, live_time_ms,
+                  measurement_id="", reference_datetime=""):
+        """Save spectrum in ANSI N42.42 XML format.
+
+        The measurement_id is stamped onto <RadMeasurement id=...> so the raw
+        N42 asset is linkable back to the parent Measurement (spec DB-GEGI-004).
+        """
         filepath = os.path.join(self.output_dir, "{}_spectrum.n42".format(prefix))
 
         real_time_s = real_time_ms / 1000.0
@@ -483,8 +607,9 @@ class DataRecorderNode(object):
   <EnergyCalibration>
     <CoefficientValues>{offset:.6f} {gain:.6f} 0.0</CoefficientValues>
   </EnergyCalibration>
-  <RadMeasurement>
+  <RadMeasurement id="{measurement_id}">
     <MeasurementClassCode>Foreground</MeasurementClassCode>
+    <StartDateTime>{reference_datetime}</StartDateTime>
     <RealTimeDuration>PT{real_time:.3f}S</RealTimeDuration>
     <Spectrum>
       <LiveTimeDuration>PT{live_time:.3f}S</LiveTimeDuration>
@@ -497,7 +622,9 @@ class DataRecorderNode(object):
             gain=gain,
             real_time=real_time_s,
             live_time=live_time_s,
-            spectrum_data=spectrum_text
+            spectrum_data=spectrum_text,
+            measurement_id=measurement_id,
+            reference_datetime=reference_datetime
         )
 
         with open(filepath, 'w') as f:
@@ -753,13 +880,12 @@ class DataRecorderNode(object):
         sigma = blob_radius * 0.4
 
         # Use dose rate for amplitude weighting: D_dot = Gamma * A / d^2
-        gamma_constants = {'Cs-137': 0.0771, 'Co-60': 0.3059}
         d = self.source_distance_m
         dose_rates = {}
         for entry in peaks:
             iso_name = entry[3]
             activity_mbq = entry[4] if len(entry) > 4 else 0.0
-            gamma = gamma_constants.get(iso_name, 0.077)
+            gamma = gamma_constant_for(self.gamma_constants, iso_name)
             dr = gamma * activity_mbq / (d * d) if d > 0 else 0.0
             if iso_name in dose_rates:
                 dose_rates[iso_name] = max(dose_rates[iso_name], dr)
@@ -802,17 +928,44 @@ class DataRecorderNode(object):
         rospy.loginfo("  Heatmap 3D CSV saved: %s (%d hot points of %dx%d grid, %d peaks, x=%.2fm)",
                       filepath, count, res, res, len(unique_peaks), distance)
 
+    # Map the driver's internal isotope/line labels to controlled radionuclide
+    # names for the database ActivityResult (spec DB-ACT-001, sec 7.3). The internal
+    # per-line label (e.g. "Co60_1332") is kept separately in the `isotope`
+    # column; `radionuclide` carries the controlled source identity.
+    _RADIONUCLIDE_MAP = {
+        'Cs137': 'Cs-137',
+        'Co60': 'Co-60',
+        'Co60_1173': 'Co-60',
+        'Co60_1332': 'Co-60',
+    }
+
+    @classmethod
+    def _controlled_radionuclide(cls, name):
+        if name in cls._RADIONUCLIDE_MAP:
+            return cls._RADIONUCLIDE_MAP[name]
+        if 'Cs137' in name or 'Cs-137' in name:
+            return 'Cs-137'
+        if 'Co60' in name or 'Co-60' in name:
+            return 'Co-60'
+        return name
+
     def _save_activity_csv(self, prefix, activities, detector_run_info,
-                           run_real_time_ms=0, run_live_time_ms=0):
+                           run_real_time_ms=0, run_live_time_ms=0,
+                           measurement_id="", reference_datetime=""):
         """Save activity measurement results as CSV.
 
-        Note on time columns:
-          - real_time_s / live_time_s are PER counting window (~60 s each); they
-            are the integration time for that window's counts and must stay
-            per-window for the activity (count-rate) maths.
-          - run_real_time_s / run_live_time_s are the WHOLE-RUN totals
-            accumulated across the recording (e.g. ~300 s for a 5-minute scan),
-            so the full scan duration is visible in every row.
+        Columns are limited to what activity estimation needs:
+          - live_time_s: PER-window integration time used for the count rate.
+          - run_real_time_s / run_live_time_s: whole-run totals (scan duration).
+          - detector_run_*: authoritative hardware real/live/dead-time for the run.
+        The per-window real_time_s / dead_time_fraction / dead_time_status columns
+        were dropped: with live dead-time polling off they duplicated live_time_s
+        and read a constant zero; the real dead time is in detector_run_*.
+
+        Provenance columns (measurement_id, measurement_basis, activity_unit,
+        reference_datetime, radionuclide) satisfy spec DB-GEGI-002/004 and
+        DB-ACT-001/002/003 so each processed peak row links to one parent
+        Measurement and never loses its unit/reference-date/basis.
         """
         import json
         filepath = os.path.join(self.output_dir, "{}_activity.csv".format(prefix))
@@ -823,38 +976,35 @@ class DataRecorderNode(object):
         with open(filepath, 'w') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "timestamp_s", "real_time_s", "live_time_s", "dead_time_fraction", "dead_time_status",
+                "timestamp_s", "live_time_s",
                 "detector_run_info_valid", "detector_run_dead_time_percent",
                 "detector_run_real_time_s", "detector_run_live_time_s",
                 "isotope", "energy_keV", "gross_counts", "background_counts",
                 "net_peak_area", "net_corrected", "count_rate_cps",
                 "activity_MBq", "sigma_activity_MBq", "valid",
-                "run_real_time_s", "run_live_time_s"
+                "run_real_time_s", "run_live_time_s",
+                "measurement_id", "radionuclide", "measurement_basis",
+                "activity_unit", "reference_datetime"
             ])
 
             for report in activities:
                 ts = report.get('timestamp', 0)
-                rt = report.get('real_time_s', 0)
                 lt = report.get('live_time_s', 0)
-                dtf = report.get('dead_time_fraction', 0)
-                dts = report.get('dead_time_status', 'unknown')
                 drv = detector_run_info.get('valid', False)
                 drdt = detector_run_info.get('dead_time_percent', 0.0)
                 drrt = detector_run_info.get('real_time_sec', 0.0)
                 drlt = detector_run_info.get('live_time_sec', 0.0)
 
                 for iso in report.get('isotopes', []):
+                    iso_name = iso.get('isotope', '')
                     writer.writerow([
                         "{:.3f}".format(ts),
-                        "{:.3f}".format(rt),
                         "{:.3f}".format(lt),
-                        "{:.6f}".format(dtf),
-                        dts,
                         drv,
                         "{:.6f}".format(drdt),
                         "{:.3f}".format(drrt),
                         "{:.3f}".format(drlt),
-                        iso.get('isotope', ''),
+                        iso_name,
                         "{:.1f}".format(iso.get('energy_keV', 0)),
                         "{:.0f}".format(iso.get('gross_counts', 0)),
                         "{:.1f}".format(iso.get('background_counts', 0)),
@@ -865,11 +1015,84 @@ class DataRecorderNode(object):
                         "{:.6f}".format(iso.get('sigma_activity_MBq', 0)),
                         iso.get('valid', False),
                         "{:.3f}".format(run_real_time_s),
-                        "{:.3f}".format(run_live_time_s)
+                        "{:.3f}".format(run_live_time_s),
+                        measurement_id,
+                        self._controlled_radionuclide(iso_name),
+                        "direct_measured",
+                        "MBq",
+                        reference_datetime
                     ])
 
         rospy.loginfo("  Activity CSV saved: %s (%d measurement windows)",
                       filepath, len(activities))
+
+    def _save_manifest(self, prefix, measurement_id, reference_datetime,
+                       duration_minutes, run_real_time_ms, run_live_time_ms,
+                       detector_run_info, activities):
+        """Write a per-run manifest linking every asset to one Measurement.
+
+        Anchors the database Measurement record (spec DB-GEGI-002/004): captures
+        the acquisition/processing configuration and the list of raw and
+        processed assets produced by this run.
+        """
+        import json
+        filepath = os.path.join(self.output_dir, "{}_manifest.json".format(prefix))
+
+        # Candidate assets with their database role; only list those written.
+        candidates = [
+            ("{}_spectrum.n42".format(prefix), "raw_spectrum_n42", "N42"),
+            ("{}_compton_events.bag".format(prefix), "raw_compton_events", "rosbag"),
+            ("{}_activity.csv".format(prefix), "processed_peak_results", "CSV"),
+            ("{}_heatmap_raw.csv".format(prefix), "gamma_image_raw", "CSV"),
+            ("{}_heatmap_raster.csv".format(prefix), "gamma_image_raster", "CSV"),
+            ("{}_heatmap_3d.csv".format(prefix), "gamma_image_3d", "CSV"),
+        ]
+        assets = []
+        for fname, role, kind in candidates:
+            fpath = os.path.join(self.output_dir, fname)
+            if os.path.exists(fpath):
+                assets.append({
+                    "file": fname,
+                    "role": role,
+                    "format": kind,
+                    "size_bytes": os.path.getsize(fpath),
+                })
+
+        # Distinct radionuclides seen in the processed results.
+        radionuclides = []
+        for report in activities:
+            for iso in report.get('isotopes', []):
+                rn = self._controlled_radionuclide(iso.get('isotope', ''))
+                if rn and rn not in radionuclides:
+                    radionuclides.append(rn)
+
+        manifest = {
+            "measurement_id": measurement_id,
+            "measurement_type": "gamma_spectroscopy+gamma_imaging",
+            "reference_datetime": reference_datetime,
+            "detector": {"manufacturer": "PHDS", "model": "GeGI", "kind": "HPGe"},
+            "acquisition": {
+                "requested_duration_minutes": duration_minutes,
+                "run_real_time_s": run_real_time_ms / 1000.0,
+                "run_live_time_s": run_live_time_ms / 1000.0,
+                "source_distance_m": self.source_distance_m,
+                "activity_basis": "direct_measured",
+            },
+            "processing_config": {
+                "calibration_file": self.calibration_file,
+                "isotopes_config": self.isotopes_config,
+                "heatmap_grid_res": self.heatmap_grid_res,
+            },
+            "detector_run_info": detector_run_info,
+            "radionuclides": radionuclides,
+            "assets": assets,
+        }
+
+        with open(filepath, 'w') as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+
+        rospy.loginfo("  Manifest saved: %s (%d assets, id=%s)",
+                      filepath, len(assets), measurement_id)
 
 
 def main():

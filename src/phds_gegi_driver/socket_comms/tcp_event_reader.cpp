@@ -587,22 +587,37 @@ namespace phds_gegi_driver::socket_comms {
                 event_lock.lock();
             }
 
-            // Run-info frame, per the GeGI remote-command manual (command 'i'):
-            //   offset  0: int32  realTime            (seconds)
-            //   offset  4: double liveTime            (seconds)
-            //   offset 12: double deadTimePercentage  (percent)
-            //   offset 20: double countRate           (counts per second)
-            // Total 28 bytes, little-endian. We decode this single documented
-            // layout deterministically rather than guessing among hypotheses.
-            constexpr size_t FRAME_BYTES = 28;
-
-            auto decode_run_info = [&](const char *base) {
-                RunInfo decoded;
-                decoded.real_time_sec = static_cast<double>(readU32(base + 0, false));
-                decoded.live_time_sec = readF64(base + 4, false);
-                decoded.dead_time_percent = readF64(base + 12, false);
-                decoded.count_rate_hz = readF64(base + 20, false);
-                return decoded;
+            // Run-info frame for command 'i'. The manual lists the LOGICAL fields
+            //   int32 realTime; double liveTime; double deadTimePercentage; double countRate;
+            // but the on-wire byte layout depends on the sender's struct alignment,
+            // so we try the plausible layouts and accept the first self-consistent
+            // one (the dead ~= (1-live/real)*100 check disambiguates):
+            //   A) packed  (28B): u32@0,       f64@4,  f64@12, f64@20
+            //   B) aligned (32B): u32@0,+4 pad, f64@8,  f64@16, f64@24  (double 8-byte aligned)
+            //   C) all-f64 (32B): f64@0,        f64@8,  f64@16, f64@24  (realTime sent as double)
+            auto decode_A = [&](const char *b) {
+                RunInfo d;
+                d.real_time_sec = static_cast<double>(readU32(b + 0, false));
+                d.live_time_sec = readF64(b + 4, false);
+                d.dead_time_percent = readF64(b + 12, false);
+                d.count_rate_hz = readF64(b + 20, false);
+                return d;
+            };
+            auto decode_B = [&](const char *b) {
+                RunInfo d;
+                d.real_time_sec = static_cast<double>(readU32(b + 0, false));
+                d.live_time_sec = readF64(b + 8, false);
+                d.dead_time_percent = readF64(b + 16, false);
+                d.count_rate_hz = readF64(b + 24, false);
+                return d;
+            };
+            auto decode_C = [&](const char *b) {
+                RunInfo d;
+                d.real_time_sec = readF64(b + 0, false);
+                d.live_time_sec = readF64(b + 8, false);
+                d.dead_time_percent = readF64(b + 16, false);
+                d.count_rate_hz = readF64(b + 24, false);
+                return d;
             };
 
             auto plausible_run_info = [](const RunInfo &c) {
@@ -648,21 +663,24 @@ namespace phds_gegi_driver::socket_comms {
             // we scan offsets and accept the first self-consistent frame. When
             // queried post-stop (the intended path) the reply arrives clean and
             // the first offset matches immediately.
-            for (int attempt = 0; attempt < 3 && !found; ++attempt) {
+            // While acquisition is streaming, the 'i' reply is buried among event
+            // packets on this shared socket, so a single short read often misses it.
+            // Retry more times, accumulate longer, and scan a larger buffer to raise
+            // the hit-rate under load. Loop breaks immediately once a frame is found,
+            // so a clean (idle/post-stop) reply still returns fast.
+            for (int attempt = 0; attempt < 6 && !found; ++attempt) {
                 const auto deadline = std::chrono::steady_clock::now()
-                                      + std::chrono::milliseconds(1500);
+                                      + std::chrono::milliseconds(2000);
                 auto buffer = sendAndAccumulateRaw(
-                    response_socket, 'i', deadline, 16384);
+                    response_socket, 'i', deadline, 65536);
 
-                if (buffer.size() >= FRAME_BYTES) {
-                    for (size_t i = 0; i + FRAME_BYTES <= buffer.size() && !found; ++i) {
-                        auto decoded = decode_run_info(buffer.data() + i);
-                        if (plausible_run_info(decoded)) {
-                            info = decoded;
-                            found = true;
-                            found_layout = "i(28B u32+f64+f64+f64)";
-                            break;
-                        }
+                const size_t bufsz = buffer.size();
+                for (size_t i = 0; i + 28 <= bufsz && !found; ++i) {
+                    const char *b = buffer.data() + i;
+                    { auto d = decode_A(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "A(28B packed)"; break; } }
+                    if (i + 32 <= bufsz) {
+                        { auto d = decode_B(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "B(32B aligned)"; break; } }
+                        { auto d = decode_C(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "C(32B 4xf64)"; break; } }
                     }
                 }
                 last_buffer = buffer;

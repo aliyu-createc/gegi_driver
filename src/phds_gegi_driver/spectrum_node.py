@@ -71,7 +71,7 @@ class SpectrumNode(object):
         self.lock = threading.Lock()
         self.seq = 0
 
-        self.sub = rospy.Subscriber(energy_topic, Float64, self._on_energy, queue_size=500)
+        self.sub = rospy.Subscriber(energy_topic, Float64, self._on_energy, queue_size=10000)
         self.pub = rospy.Publisher(spectrum_topic, Spectrum, queue_size=2)
         self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
 

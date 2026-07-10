@@ -1,24 +1,24 @@
 param(
-    [switch]$Cumulative
+    [switch]$Cumulative,
+    [string]$RosHost = "localhost",
+    [int]$RosPort = 9090
 )
 # Launch the live spectrum plotter natively on Windows via rosbridge.
 # Requires:
-#   - Container 'gegi' running with gegi_full_pipeline.launch
-#   - rosbridge_server running in container (port 9090)
-#   - pip install roslibpy matplotlib numpy
+#   - gegi_full_pipeline.launch running (WSL distro 'ros-melodic': ~/gegi_ws/run.sh),
+#     which starts rosbridge_server on port 9090
+#   - pip install roslibpy matplotlib numpy   (in the Windows Python env)
 #
 # Usage:
-#   .\plot_spectrum.ps1              # Show latest snapshot each update
-#   .\plot_spectrum.ps1 -Cumulative  # Accumulate counts over time
+#   .\plot_spectrum.ps1                       # Show latest snapshot each update
+#   .\plot_spectrum.ps1 -Cumulative           # Accumulate counts over time
+#   .\plot_spectrum.ps1 -RosHost <wsl-ip>     # If localhost forwarding fails, use `wsl hostname -I`
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonScript = Join-Path $scriptDir "plot_live_spectrum.py"
 
-# Ensure rosbridge is running in the container
-docker exec gegi bash -c "source /opt/ros/melodic/setup.bash && source /opt/phds_gegi_driver/devel/setup.bash && rosnode list" 2>$null | Out-Null
-
-$args_ = @($pythonScript, "--host", "localhost", "--port", "9090")
+$args_ = @($pythonScript, "--host", $RosHost, "--port", $RosPort)
 if ($Cumulative) {
     $args_ += "--cumulative"
 }

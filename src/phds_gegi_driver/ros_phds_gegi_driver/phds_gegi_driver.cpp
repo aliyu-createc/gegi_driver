@@ -40,7 +40,10 @@ namespace phds_gegi_driver {
         getParam(pn, "detector_frame", detector_frame_);
         getParam(pn, "detector_info_cache_max_age_sec", detector_info_cache_max_age_sec_);
 
-        constexpr static int OUTPUT_BUFFER_SIZE = 100;
+        // Deep publisher queues so bursts of events are never dropped between
+        // the reader thread and slower subscribers (spectrum/heatmap/recorder).
+        // Small Float64/ComptonEvent messages make a large queue cheap.
+        constexpr static int OUTPUT_BUFFER_SIZE = 10000;
         event_publisher_ = n.advertise<radiation_detector_msgs::ComptonEvent>(event_topic, OUTPUT_BUFFER_SIZE);
         energy_publisher_ = n.advertise<std_msgs::Float64>(energy_topic, OUTPUT_BUFFER_SIZE);
         singles_energy_publisher_ = n.advertise<std_msgs::Float64>(singles_energy_topic, OUTPUT_BUFFER_SIZE);
@@ -213,21 +216,14 @@ namespace phds_gegi_driver {
                     const bool monotonic = delta_real >= -0.5 && delta_live >= -0.5;
                     const double max_growth = wall_dt * 3.0 + 5.0;
                     const bool growth_reasonable = delta_real <= max_growth && delta_live <= max_growth;
-                    // Live time can advance slowly at high dead-time, but if real-time
-                    // advances significantly while live-time remains effectively flat
-                    // under non-zero count rate, this is typically a stale/latched frame.
-                    const bool detector_active = res.count_rate_hz > 1.0;
-                    const bool real_advanced = delta_real >= 5.0;
-                    const bool live_stalled = std::fabs(delta_live) <= 0.25;
-                    const bool stale_live_time = detector_active && real_advanced && live_stalled;
-
-                    temporally_consistent = monotonic && growth_reasonable && !stale_live_time;
-                    if (!temporally_consistent && stale_live_time) {
-                        ROS_WARN_STREAM("Rejecting run-info sample due to stalled live-time: "
-                                        << "delta_real=" << delta_real
-                                        << " delta_live=" << delta_live
-                                        << " count_rate_hz=" << res.count_rate_hz);
-                    }
+                    // NOTE: a stalled live-time while real-time advances is NOT a stale
+                    // frame - a truly latched frame would show delta_real ~ 0 too. Real
+                    // advancing while live stalls is exactly what GENUINE high dead-time
+                    // looks like (the observable we want in Experiment C), so we accept
+                    // it. Monotonicity + bounded growth still reject garbage/replayed
+                    // frames. (Previously a stale_live_time heuristic wrongly rejected
+                    // real high-dead-time samples.)
+                    temporally_consistent = monotonic && growth_reasonable;
                 }
             }
 

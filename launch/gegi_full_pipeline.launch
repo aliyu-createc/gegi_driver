@@ -3,6 +3,16 @@
     <!-- Full GeGI pipeline: driver + spectrum + spherical heatmap -->
     <arg name="gegi_ip" default="192.168.50.109"/>
     <arg name="gegi_port" default="27015"/>
+    <!-- Where the data_recorder writes runs. Override to a /mnt/c path to land
+         files directly in the Windows repo data/ folder (see run.sh). -->
+    <arg name="output_dir" default="/opt/phds_gegi_driver/data"/>
+    <!-- Multi-source peak sensitivity (lower = detect weaker/off-axis sources). -->
+    <arg name="peak_threshold" default="0.5"/>
+    <!-- Ghost-peak rejection strength; set to 1 to disable temporal persistence. -->
+    <arg name="peak_persist_min" default="2"/>
+    <!-- Ghost rejection by event support (raise to reject more ghosts). -->
+    <arg name="support_ratio" default="0.8"/>
+    <arg name="min_source_events" default="15"/>
 
     <!-- GeGI control driver -->
     <include file="$(find phds_gegi_driver)/launch/gegi_driver.launch">
@@ -37,13 +47,20 @@
     </include>
 
     <!-- Spherical heatmap with isotope ID -->
-    <include file="$(find phds_gegi_driver)/launch/spherical_heatmap.launch"/>
+    <include file="$(find phds_gegi_driver)/launch/spherical_heatmap.launch">
+        <arg name="peak_threshold" value="$(arg peak_threshold)"/>
+        <arg name="peak_persist_min" value="$(arg peak_persist_min)"/>
+        <arg name="support_ratio" value="$(arg support_ratio)"/>
+        <arg name="min_source_events" value="$(arg min_source_events)"/>
+    </include>
 
     <!-- Activity computation (net peak area and Bq per isotope) -->
     <include file="$(find phds_gegi_driver)/launch/activity.launch"/>
 
     <!-- Data recorder (saves .bag, .n42, .csv at end of timed acquisition) -->
-    <include file="$(find phds_gegi_driver)/launch/data_recorder.launch"/>
+    <include file="$(find phds_gegi_driver)/launch/data_recorder.launch">
+        <arg name="output_dir" value="$(arg output_dir)"/>
+    </include>
 
     <!-- Rosbridge websocket server for Windows-side plotting tools -->
     <include file="$(find rosbridge_server)/launch/rosbridge_websocket.launch"/>

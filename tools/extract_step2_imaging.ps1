@@ -192,7 +192,9 @@ function Get-ActivitySummary {
         }
     }
 
-    $dtMean = ($rows | Measure-Object -Property dead_time_fraction -Average).Average
+    # Dead time now comes from the detector hardware run-info (percent -> fraction).
+    $dtPctMean = ($rows | Measure-Object -Property detector_run_dead_time_percent -Average).Average
+    $dtMean = if ($null -ne $dtPctMean) { $dtPctMean / 100.0 } else { 0.0 }
     $ltMean = ($rows | Measure-Object -Property live_time_s -Average).Average
 
     $windows = $rows | Group-Object -Property timestamp_s

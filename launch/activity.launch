@@ -7,6 +7,10 @@
     <arg name="spectrum_topic" default="/spectrum"/>
     <!-- Geometric solid angle fraction for tray geometry (0 = use config file value) -->
     <arg name="solid_angle_fraction" default="0.0"/>
+    <!-- Initial number of in-line shielding plates (0 = none). Change at runtime
+         by publishing std_msgs/Int32 to /activity/n_shielding_plates. Geometry
+         (standoff, plate thickness, per-line attenuation) is set in isotopes.yaml. -->
+    <arg name="n_shielding_plates" default="0"/>
 
     <node name="activity" pkg="phds_gegi_driver" type="activity_node.py" output="screen">
         <param name="calibration_file" value="$(arg calibration_file)"/>
@@ -14,6 +18,7 @@
         <param name="counting_window_s" value="$(arg counting_window_s)"/>
         <param name="spectrum_topic" value="$(arg spectrum_topic)"/>
         <param name="solid_angle_fraction" value="$(arg solid_angle_fraction)"/>
+        <param name="n_shielding_plates" value="$(arg n_shielding_plates)"/>
         <param name="publish_on_window" value="true"/>
     </node>
 </launch>
