@@ -301,3 +301,23 @@ error_log
 
 *.bak
 *.backup
+
+#######################################
+# Client / controlled documents       #
+# Must NOT be committed: this repo     #
+# pushes to GitHub.                    #
+#######################################
+E466*.pdf
+GeGI database specification.docx
+GeGI database specification.md
+
+#######################################
+# Measurement data                    #
+# Raw evidence lives in the Auto-SAS   #
+# database / archive, not in git       #
+# (E466 6.1). Bags already excluded.   #
+#######################################
+data/
+
+# Word lock/temp files
+~$*

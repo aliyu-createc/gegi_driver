@@ -1,0 +1,134 @@
+# Isotope configuration for activity calculation.
+# ROI and sideband energies are in keV.
+#
+# Geometry-independent activity measurement:
+#   The calibration_factor (Bq/cps, measured at calibration_distance_m) is used to
+#   DERIVE the detector's true intrinsic efficiency:
+#     eps_intrinsic = 1 / (CF * solid_angle(cal_dist) * I_gamma)
+#   This intrinsic efficiency is a detector constant — it never changes.
+#   At any source distance d, activity is then:
+#     A = N_net / (eps_intrinsic * solid_angle(d) * I_gamma * t_live)
+#
+#   To use: set source_distance_m to the actual source distance. The node
+#   auto-computes solid angle and gives correct activity at ANY distance.
+#   Distance can be updated at runtime via the ~/source_distance topic.
+
+# Specific gamma-ray dose rate constants (uSv*m^2 / MBq*h)
+# Used to convert measured activity to ambient dose rate.
+gamma_constants:
+  Cs137: 0.0771
+  Co60: 0.3059
+
+# Counting window: how many seconds of spectra to accumulate before computing activity.
+counting_window_s: 60.0
+
+# Minimum net counts required for a valid activity estimate (per philosophy doc: 400)
+min_net_counts: 400
+
+# Source distance in metres. When set (> 0), the node auto-computes the
+# solid angle fraction and applies a distance correction to calibration factors.
+# This makes measured activity distance-independent.
+# Set to 0 to disable (uses raw calibration factor assuming calibration geometry).
+# Upward-facing mount: this is the BARE (0-steel) source-to-detector-face distance.
+# The permanent 5 mm shield (base_shield_plates below) plus any operator plates are
+# added on top, so the measured 33 cm (which includes the permanent plate) = 0.325
+# + 1*0.005. The effective distance is derived from the plate count at runtime.
+source_distance_m: 0.325
+
+# Distance at which the empirical calibration factors were measured.
+calibration_distance_m: 0.5
+
+# Geometric solid angle fraction: Omega / (4*pi)
+# For a point source at distance d from a circular crystal of radius r:
+#   solid_angle_fraction = 0.5 * (1 - d / sqrt(d^2 + r^2))
+# GeGI crystal: 90-mm diameter (r = 0.045 m), 11-mm thick, active area 61 cm2.
+# At d = 0.5 m: 0.5*(1 - 0.5/sqrt(0.25+0.002025)) = 0.00202
+# NOTE: If source_distance_m is set, solid_angle_fraction is auto-computed.
+solid_angle_fraction: 0.00202
+
+# Detector crystal radius (m), used in the solid-angle formula above.
+# GeGI: 90-mm diameter -> r = 0.045 m. (Previously hardcoded in the driver.)
+crystal_radius_m: 0.045
+
+# ---------------------------------------------------------------------------
+# In-line shielding for high-activity trays.
+# The GeGI is on an upward-facing frame with a permanent 5 mm steel plate over
+# the crystal (base_shield_plates). When a tray is too hot, further identical
+# plates are added on top. The operator sets only the EXTRA plate count via the
+# ~n_shielding_plates parameter or the ~/n_shielding_plates topic (std_msgs/Int32):
+#   0 for a normal tray, 1/2/3... for hot ones.
+# total_plates = base_shield_plates + n_shielding_plates, and the driver derives
+# BOTH of the following from it, with no code change:
+#   source_distance_m = base_standoff_m + total_plates * plate_thickness_m
+#   transmission(E)   = exp(-mu_shield_per_m(E) * total_plates * plate_thickness_m)
+# Activity is corrected by dividing the measured value by transmission(E).
+# mu is energy-dependent, so it is set per gamma line on each isotope below.
+shielding:
+  material: "steel"            # carbon steel, rho ~7.87 g/cm3
+  plate_thickness_m: 0.005     # 5 mm per plate
+  base_standoff_m: 0.325       # BARE 0-steel source-detector-face distance
+  base_shield_plates: 1        # permanent mounted plate(s) always in the beam
+# ---------------------------------------------------------------------------
+
+isotopes:
+  Cs137:
+    energy_keV: 661.7
+    emission_probability: 0.851
+    peak_roi_keV: [655.0, 669.0]
+    left_sideband_keV: [620.0, 645.0]
+    right_sideband_keV: [680.0, 705.0]
+    # Empirical calibration factor (Bq/cps) measured at calibration_distance_m (0.5m).
+    # Used to DERIVE geometry-independent intrinsic efficiency:
+    #   eps_intrinsic = 1 / (CF * omega_cal * I_gamma) = 0.012783
+    calibration_factor: 45672.0
+    # OPTIONAL manual override: absolute full-energy-peak efficiency at the
+    # measurement geometry. LEAVE 0.0 to use the calibration_factor-derived,
+    # geometry-independent path above (this is the intended mode). A value > 0
+    # is ONLY used when calibration_factor and measured_intrinsic_efficiency are
+    # both absent (legacy "manual_efficiency" fallback). See activity_node.py.
+    efficiency: 0.0
+    # Linear attenuation coefficient (1/m) of the shielding-plate material at
+    # 662 keV. transmission = exp(-mu_shield_per_m * n_plates * plate_thickness_m).
+    # Steel at 662 keV: mu/rho ~0.0729 cm2/g * 7.87 g/cm3 = 0.574/cm = 57.4/m.
+    mu_shield_per_m: 57.4
+
+  Co60_1173:
+    energy_keV: 1173.2
+    emission_probability: 0.9985
+    peak_roi_keV: [1165.0, 1181.0]
+    left_sideband_keV: [1140.0, 1158.0]
+    right_sideband_keV: [1190.0, 1208.0]
+    # Corrected 2026-07-09 from 117730.0 (-8.7%) by DJR Assay Experiment B:
+    #   certificated 1.130 MBq Co-60 (ref 2026-06-01) read +9.5% high at 0.33 m
+    #   through 1 plate; 15-min run data/Experiment B/Co60/20260709_130120.
+    #   New CF sets the 1173 keV line to the decay-corrected certificate and
+    #   makes eps(1173)/eps(1332) match the measured photopeak ratio (1.453).
+    #   Original 0.5 m derivation gave eps_intrinsic = 0.004226. Reconfirm on an
+    #   independent run before treating as final (+-3-5% certificate uncertainty).
+    calibration_factor: 107490.0
+    # OPTIONAL manual override (see Cs137 note): leave 0.0 to derive efficiency
+    # from calibration_factor. Only used if calibration_factor is absent.
+    efficiency: 0.0
+    # Steel at 1173 keV: mu/rho ~0.0531 cm2/g * 7.87 = 0.418/cm = 41.8/m.
+    mu_shield_per_m: 41.8
+
+  Co60_1332:
+    energy_keV: 1332.5
+    emission_probability: 0.9998
+    peak_roi_keV: [1325.0, 1340.0]
+    left_sideband_keV: [1300.0, 1318.0]
+    right_sideband_keV: [1348.0, 1366.0]
+    # Corrected 2026-07-09 by DJR Assay Experiment B (163393.0 -> 155990.0), then
+    # REFINED to 152010.0 by Experiment D (10x 5-min Co-60, data/Experiment D/):
+    #   the 1332 line still read +2.6% high vs the certificate over 10 runs, so
+    #   CF reduced a further 2.6% to centre it (1173 line was already on cert).
+    #   certificate 1.130 MBq Co-60, ref 2026-06-01. Original 0.5 m derivation
+    #   gave eps_intrinsic = 0.003041. Repeatability (Type A) = 2.1%.
+    calibration_factor: 152010.0
+    # OPTIONAL manual override (see Cs137 note): leave 0.0 to derive efficiency
+    # from calibration_factor. Only used if calibration_factor is absent.
+    efficiency: 0.0
+    # Steel at 1332 keV: mu/rho ~0.0503 cm2/g * 7.87 = 0.396/cm = 39.6/m.
+    mu_shield_per_m: 39.6
+
+

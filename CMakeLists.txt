@@ -62,6 +62,22 @@ target_link_libraries(${PROJECT_NAME}_node ${PROJECT_NAME} ${catkin_LIBRARIES})
 catkin_install_python(PROGRAMS
   src/phds_gegi_driver/spectrum_node.py
   src/phds_gegi_driver/spherical_heatmap_node.py
+  src/phds_gegi_driver/activity_node.py
+  src/phds_gegi_driver/data_recorder_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+## Unit tests (pure logic - no detector, no roscore required).
+## Run with:  catkin_make run_tests   or   bash test/run_tests.sh
+## Guarded on the directory existing: some deployments sync only the runtime
+## sources, and a missing test/ must not break the build.
+if(CATKIN_ENABLE_TESTING AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  catkin_add_nosetests(test/test_activity_physics.py)
+  catkin_add_nosetests(test/test_config_contract.py)
+  catkin_add_nosetests(test/test_gamma_constants.py)
+  catkin_add_nosetests(test/test_analysis_tools.py)
+  catkin_add_nosetests(test/test_spectrum.py)
+  catkin_add_nosetests(test/test_heatmap.py)
+  catkin_add_nosetests(test/test_n42_activity.py)
+endif()
 

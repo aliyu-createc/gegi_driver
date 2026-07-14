@@ -22,6 +22,7 @@
 
 #include <cstdlib> // exit
 #include <functional> // bind
+#include <mutex> // mutex
 #include <string> // string
 
 namespace phds_gegi_driver {
@@ -35,6 +36,8 @@ namespace phds_gegi_driver {
         void process2SiteEvent(const compton_events::Event2Site &event);
 
         void publishEnergy(double energy_kev);
+
+        void publishSinglesEnergy(double energy_kev);
 
         // Remote control service callbacks
         bool handleStartAcquisition(phds_gegi_driver::StartAcquisition::Request &req,
@@ -58,6 +61,7 @@ namespace phds_gegi_driver {
 
         ros::Publisher event_publisher_;
         ros::Publisher energy_publisher_;
+        ros::Publisher singles_energy_publisher_;
 
         // Remote control service servers
         ros::ServiceServer start_acq_service_;
@@ -67,6 +71,21 @@ namespace phds_gegi_driver {
         ros::ServiceServer detector_info_service_;
         ros::ServiceServer toggle_bias_service_;
         ros::ServiceServer timed_acq_service_;
+
+        // Last accepted detector run-info sample (used to reject jumpy artifacts).
+        std::mutex run_info_history_mutex_;
+        bool has_last_valid_run_info_ = false;
+        double last_run_info_real_time_sec_ = 0.0;
+        double last_run_info_live_time_sec_ = 0.0;
+        ros::Time last_run_info_stamp_;
+
+        // Last accepted detector-info sample (used as bounded fallback when
+        // detector does not answer info requests transiently).
+        std::mutex detector_info_cache_mutex_;
+        bool has_last_valid_detector_info_ = false;
+        socket_comms::DetectorInfo last_detector_info_;
+        ros::Time last_detector_info_stamp_;
+        double detector_info_cache_max_age_sec_ = 120.0;
 
         std::string detector_frame_;
 

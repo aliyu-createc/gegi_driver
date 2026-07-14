@@ -8,8 +8,12 @@
 
 #include <cmath>
 #include <chrono>
+#include <cctype>
+#include <iomanip>
 #include <cstdint>
 #include <cstring>
+#include <sstream>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -91,10 +95,47 @@ namespace phds_gegi_driver::socket_comms {
             std::memcpy(&output, &value, sizeof(double));
             return output;
         }
+
+        void flushSocketInputBuffer(boost::asio::ip::tcp::socket &socket, size_t max_bytes = 1 << 20) {
+            size_t drained_total = 0;
+            for (;;) {
+                boost::system::error_code error;
+                const size_t available = socket.available(error);
+                if (error) {
+                    std::cerr << "Socket available() failed during flush: "
+                              << error.message() << std::endl;
+                    return;
+                }
+                if (available == 0) {
+                    break;
+                }
+
+                const size_t to_read = std::min<size_t>(available, 4096);
+                std::vector<char> scratch(to_read);
+                const size_t n = socket.read_some(boost::asio::buffer(scratch), error);
+                if (error) {
+                    std::cerr << "Socket read_some() failed during flush: "
+                              << error.message() << std::endl;
+                    return;
+                }
+
+                drained_total += n;
+                if (drained_total >= max_bytes) {
+                    std::cerr << "Socket flush capped at " << drained_total << " bytes" << std::endl;
+                    break;
+                }
+            }
+
+            if (drained_total > 0) {
+                std::cout << "Flushed " << drained_total
+                          << " stale bytes before command response read" << std::endl;
+            }
+        }
     }
 
     TcpEventReader::TcpEventReader(Callback1Site callback_1_site, Callback2Site callback_2_site)
             : socket_(io_service_),
+                            command_socket_(io_service_),
               callback_1_site_(std::move(callback_1_site)),
               callback_2_site_(std::move(callback_2_site)) {}
 
@@ -113,6 +154,18 @@ namespace phds_gegi_driver::socket_comms {
         } catch (const std::exception &ex) {
             throw;
         }
+
+        // NOTE: Do NOT open a second TCP connection for commands.
+        //
+        // The GeGI streams events back on the SAME connection that issued the
+        // start-acquisition command, and only services one streaming session at
+        // a time. A dedicated command socket caused start/stop/timed-acquisition
+        // commands to be sent on command_socket_ while the monitor thread reads
+        // events from socket_ — so events were streamed to a socket nobody read,
+        // producing zero counts. Keeping a single socket restores the proven
+        // behaviour: commands and the event stream share socket_, serialised via
+        // socket_mutex_/response_mutex_. (command_socket_ stays closed; all
+        // command/run-info paths fall back to socket_ when it is not open.)
 
         std::cout << "Connected to GeGI at " + ip + ":" + port << std::endl;
     }
@@ -368,33 +421,47 @@ namespace phds_gegi_driver::socket_comms {
             throw std::runtime_error("Trying to disconnect from socket when monitoring data off it");
         }
 
-        if (!socket_.is_open()) {
-            std::cerr << "Trying to disconnect from closed socket" << std::endl;
+        if (!socket_.is_open() && !command_socket_.is_open()) {
+            std::cerr << "Trying to disconnect from closed sockets" << std::endl;
             return;
         }
 
         boost::system::error_code error;
 
-        socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, error);
-        if (error) {
-            throw std::runtime_error("Could not shutdown socket");
+        if (command_socket_.is_open()) {
+            command_socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, error);
+            command_socket_.close(error);
         }
 
-        socket_.close(error);
-        if (error) {
-            throw std::runtime_error("Could not close socket");
+        if (socket_.is_open()) {
+            socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, error);
+            if (error) {
+                throw std::runtime_error("Could not shutdown socket");
+            }
+
+            socket_.close(error);
+            if (error) {
+                throw std::runtime_error("Could not close socket");
+            }
         }
     }
 
     bool TcpEventReader::sendCommand(char cmd) {
-        if (!socket_.is_open()) {
+        std::lock_guard<std::mutex> command_lock(command_mutex_);
+        boost::asio::ip::tcp::socket *command_channel = command_socket_.is_open() ? &command_socket_ : &socket_;
+
+        if (!command_channel->is_open()) {
             std::cerr << "Socket not open; cannot send command '" << cmd << "'" << std::endl;
             return false;
         }
 
         try {
-            std::lock_guard<std::mutex> lock(socket_mutex_);
-            boost::asio::write(socket_, boost::asio::buffer(&cmd, 1));
+            if (command_channel == &socket_) {
+                std::lock_guard<std::mutex> lock(socket_mutex_);
+                boost::asio::write(*command_channel, boost::asio::buffer(&cmd, 1));
+            } else {
+                boost::asio::write(*command_channel, boost::asio::buffer(&cmd, 1));
+            }
             std::cout << "Sent command '" << cmd << "' to detector" << std::endl;
             return true;
         } catch (const std::exception &ex) {
@@ -424,7 +491,9 @@ namespace phds_gegi_driver::socket_comms {
     }
 
     bool TcpEventReader::sendTimedAcquisition(char preset_cmd) {
-        if (preset_cmd < '1' || preset_cmd > '5') {
+        // Presets '1'-'8' map to 5/10/15/20/25/30/45/60-minute (live-time)
+        // acquisitions per the GeGI remote-command manual.
+        if (preset_cmd < '1' || preset_cmd > '8') {
             std::cerr << "Invalid timed acquisition preset command '" << preset_cmd << "'" << std::endl;
             return false;
         }
@@ -432,60 +501,212 @@ namespace phds_gegi_driver::socket_comms {
         return sendCommand(preset_cmd);
     }
 
+    // ─── Helpers for command response extraction ───────────────────────────
+    //
+    // The GeGI detector multiplexes event stream data and command responses on
+    // a single TCP connection.  We accumulate all received bytes after sending
+    // a command and scan for the response frame using strong plausibility
+    // checks that exploit the mathematical self-consistency of the response
+    // fields (e.g. dead_time ≈ (1 - live/real) × 100).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    namespace {
+        // Flush, send command, accumulate raw bytes until deadline or max_bytes.
+        std::vector<char> sendAndAccumulateRaw(
+                boost::asio::ip::tcp::socket &socket,
+                char cmd,
+                std::chrono::steady_clock::time_point deadline,
+                size_t max_bytes = 16384) {
+
+            std::cout << "sendAndAccumulateRaw('" << cmd << "'): socket open="
+                      << socket.is_open() << " native=" << socket.native_handle()
+                      << std::endl;
+
+            flushSocketInputBuffer(socket);
+
+            boost::system::error_code write_error;
+            boost::asio::write(socket, boost::asio::buffer(&cmd, 1), write_error);
+            if (write_error) {
+                std::cerr << "sendAndAccumulateRaw: write FAILED: " << write_error.message() << std::endl;
+                return {};
+            }
+            std::cout << "sendAndAccumulateRaw('" << cmd << "'): command sent OK" << std::endl;
+
+            std::vector<char> buffer;
+            buffer.reserve(max_bytes);
+            int poll_count = 0;
+
+            while (std::chrono::steady_clock::now() < deadline && buffer.size() < max_bytes) {
+                boost::system::error_code error;
+                const size_t available = socket.available(error);
+                if (error) {
+                    std::cerr << "sendAndAccumulateRaw: available() error: " << error.message() << std::endl;
+                    break;
+                }
+
+                if (available > 0) {
+                    const size_t to_read = std::min<size_t>(available, 4096);
+                    std::vector<char> chunk(to_read);
+                    const size_t n = socket.read_some(boost::asio::buffer(chunk), error);
+                    if (error) {
+                        std::cerr << "sendAndAccumulateRaw: read_some() error: " << error.message() << std::endl;
+                        break;
+                    }
+                    buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + static_cast<long long>(n));
+                } else {
+                    poll_count++;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+
+            std::cout << "sendAndAccumulateRaw('" << cmd << "'): accumulated "
+                      << buffer.size() << " bytes, polled " << poll_count << " times" << std::endl;
+            return buffer;
+        }
+    }
+
     RunInfo TcpEventReader::getRunInfo() {
         RunInfo info;
-        if (!socket_.is_open()) {
+        if (!socket_.is_open() && !command_socket_.is_open()) {
             std::cerr << "Socket not open; cannot request run info" << std::endl;
             return info;
         }
 
         try {
-            std::lock_guard<std::mutex> resp_lock(response_mutex_);
-            std::lock_guard<std::mutex> lock(socket_mutex_);
-            char cmd = 'r';
-            boost::asio::write(socket_, boost::asio::buffer(&cmd, 1));
+            std::lock_guard<std::mutex> command_lock(command_mutex_);
 
-            // Read response: int(4) + double(8) + double(8) + int(4) = 24 bytes
-            std::vector<char> response(24);
-            if (!readExactlyWithTimeout(socket_, response.data(), response.size(), 3000)) {
-                std::cerr << "Timed out waiting for run info response" << std::endl;
-            } else {
-                auto decode_run_info = [&](bool big_endian) {
-                    RunInfo decoded;
-                    decoded.real_time_sec = static_cast<double>(readU32(response.data() + 0, big_endian));
-                    decoded.live_time_sec = readF64(response.data() + 4, big_endian);
-                    decoded.dead_time_percent = readF64(response.data() + 12, big_endian);
-                    decoded.count_rate_hz = static_cast<double>(readU32(response.data() + 20, big_endian));
-                    return decoded;
-                };
+            // Use command_socket_ if available (it receives events + responses
+            // from the detector). Fall back to stream socket if not open.
+            boost::asio::ip::tcp::socket &response_socket = command_socket_.is_open() ? command_socket_ : socket_;
+            const bool using_event_socket = (&response_socket == &socket_);
 
-                auto plausible_run_info = [](const RunInfo &candidate) {
-                    return std::isfinite(candidate.real_time_sec)
-                           && std::isfinite(candidate.live_time_sec)
-                           && std::isfinite(candidate.dead_time_percent)
-                           && std::isfinite(candidate.count_rate_hz)
-                           && candidate.real_time_sec >= 0.0
-                           && candidate.live_time_sec >= 0.0
-                           && candidate.dead_time_percent >= -100.0
-                           && candidate.dead_time_percent <= 100.0
-                           && candidate.count_rate_hz >= 0.0
-                           && candidate.real_time_sec <= 1.0e8
-                           && candidate.live_time_sec <= 1.0e8
-                           && candidate.count_rate_hz <= 1.0e8;
-                };
-
-                const auto little_endian = decode_run_info(false);
-                const auto big_endian = decode_run_info(true);
-                if (plausible_run_info(little_endian)) {
-                    info = little_endian;
-                } else if (plausible_run_info(big_endian)) {
-                    info = big_endian;
-                } else {
-                    info = little_endian;
-                }
+            std::unique_lock<std::mutex> resp_lock(response_mutex_, std::defer_lock);
+            std::unique_lock<std::mutex> event_lock(socket_mutex_, std::defer_lock);
+            if (using_event_socket) {
+                resp_lock.lock();
+                event_lock.lock();
             }
 
-            std::cout << "Run Info: realTime=" << info.real_time_sec << "s, "
+            // Run-info frame for command 'i'. The manual lists the LOGICAL fields
+            //   int32 realTime; double liveTime; double deadTimePercentage; double countRate;
+            // but the on-wire byte layout depends on the sender's struct alignment,
+            // so we try the plausible layouts and accept the first self-consistent
+            // one (the dead ~= (1-live/real)*100 check disambiguates):
+            //   A) packed  (28B): u32@0,       f64@4,  f64@12, f64@20
+            //   B) aligned (32B): u32@0,+4 pad, f64@8,  f64@16, f64@24  (double 8-byte aligned)
+            //   C) all-f64 (32B): f64@0,        f64@8,  f64@16, f64@24  (realTime sent as double)
+            auto decode_A = [&](const char *b) {
+                RunInfo d;
+                d.real_time_sec = static_cast<double>(readU32(b + 0, false));
+                d.live_time_sec = readF64(b + 4, false);
+                d.dead_time_percent = readF64(b + 12, false);
+                d.count_rate_hz = readF64(b + 20, false);
+                return d;
+            };
+            auto decode_B = [&](const char *b) {
+                RunInfo d;
+                d.real_time_sec = static_cast<double>(readU32(b + 0, false));
+                d.live_time_sec = readF64(b + 8, false);
+                d.dead_time_percent = readF64(b + 16, false);
+                d.count_rate_hz = readF64(b + 24, false);
+                return d;
+            };
+            auto decode_C = [&](const char *b) {
+                RunInfo d;
+                d.real_time_sec = readF64(b + 0, false);
+                d.live_time_sec = readF64(b + 8, false);
+                d.dead_time_percent = readF64(b + 16, false);
+                d.count_rate_hz = readF64(b + 24, false);
+                return d;
+            };
+
+            auto plausible_run_info = [](const RunInfo &c) {
+                // Basic range checks
+                if (!std::isfinite(c.real_time_sec) || !std::isfinite(c.live_time_sec)
+                    || !std::isfinite(c.dead_time_percent) || !std::isfinite(c.count_rate_hz))
+                    return false;
+                if (c.real_time_sec < 0.0 || c.real_time_sec > 86400.0) return false;
+                if (c.live_time_sec < 0.0 || c.live_time_sec > 86400.0) return false;
+                if (c.live_time_sec > c.real_time_sec + 0.001) return false;
+                if (c.dead_time_percent < 0.0 || c.dead_time_percent > 100.0) return false;
+                if (c.count_rate_hz < 0.0 || c.count_rate_hz > 1.0e7) return false;
+
+                // Idle state: all zeros is valid
+                const bool idle = (c.real_time_sec == 0.0 && c.live_time_sec == 0.0
+                                   && c.count_rate_hz == 0.0 && c.dead_time_percent == 0.0);
+                if (idle) return true;
+
+                // Active acquisition checks
+                if (c.real_time_sec < 1.0) return false;
+                if (c.count_rate_hz < 1.0) return false;
+
+                // Live fraction must be reasonable
+                const double lf = c.live_time_sec / c.real_time_sec;
+                if (lf < 0.01 || lf > 1.001) return false;
+
+                // CRITICAL self-consistency check:
+                // dead_time_percent must approximately equal (1 - live/real) * 100
+                const double derived_dead = 100.0 * (1.0 - lf);
+                if (std::fabs(c.dead_time_percent - derived_dead) > 1.0) return false;
+
+                return true;
+            };
+
+            bool found = false;
+            std::vector<char> last_buffer;
+            std::string found_layout;
+
+            // Command 'i' = "Requests Run Information". (Note: 'r' is the
+            // detector's reachback/file-save command — do NOT use it here.)
+            // The response shares the event socket, so when acquisition is
+            // streaming the 28-byte frame may be surrounded by event packets;
+            // we scan offsets and accept the first self-consistent frame. When
+            // queried post-stop (the intended path) the reply arrives clean and
+            // the first offset matches immediately.
+            // While acquisition is streaming, the 'i' reply is buried among event
+            // packets on this shared socket, so a single short read often misses it.
+            // Retry more times, accumulate longer, and scan a larger buffer to raise
+            // the hit-rate under load. Loop breaks immediately once a frame is found,
+            // so a clean (idle/post-stop) reply still returns fast.
+            for (int attempt = 0; attempt < 6 && !found; ++attempt) {
+                const auto deadline = std::chrono::steady_clock::now()
+                                      + std::chrono::milliseconds(2000);
+                auto buffer = sendAndAccumulateRaw(
+                    response_socket, 'i', deadline, 65536);
+
+                const size_t bufsz = buffer.size();
+                for (size_t i = 0; i + 28 <= bufsz && !found; ++i) {
+                    const char *b = buffer.data() + i;
+                    { auto d = decode_A(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "A(28B packed)"; break; } }
+                    if (i + 32 <= bufsz) {
+                        { auto d = decode_B(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "B(32B aligned)"; break; } }
+                        { auto d = decode_C(b); if (plausible_run_info(d)) { info = d; found = true; found_layout = "C(32B 4xf64)"; break; } }
+                    }
+                }
+                last_buffer = buffer;
+            }
+
+            if (!found) {
+                std::cerr << "Timed out waiting for valid run info response" << std::endl;
+                if (!last_buffer.empty()) {
+                    const size_t n = std::min<size_t>(last_buffer.size(), 96);
+                    std::ostringstream oss;
+                    oss << std::hex << std::setfill('0');
+                    for (size_t i = 0; i < n; ++i) {
+                        oss << std::setw(2)
+                            << (static_cast<unsigned int>(
+                                static_cast<unsigned char>(last_buffer[i])));
+                    }
+                    std::cerr << "Run info debug: captured " << last_buffer.size()
+                              << " bytes, first " << n << " hex=" << oss.str() << std::endl;
+                }
+                info.real_time_sec = std::numeric_limits<double>::quiet_NaN();
+                info.live_time_sec = std::numeric_limits<double>::quiet_NaN();
+                info.dead_time_percent = std::numeric_limits<double>::quiet_NaN();
+                info.count_rate_hz = std::numeric_limits<double>::quiet_NaN();
+            }
+
+            std::cout << "Run Info [" << (found ? found_layout : "FAIL") << "]: realTime=" << info.real_time_sec << "s, "
                       << "liveTime=" << info.live_time_sec << "s, "
                       << "deadTime=" << info.dead_time_percent << "%, "
                       << "countRate=" << info.count_rate_hz << " Hz" << std::endl;
@@ -499,58 +720,123 @@ namespace phds_gegi_driver::socket_comms {
 
     DetectorInfo TcpEventReader::getDetectorInfo() {
         DetectorInfo info;
-        if (!socket_.is_open()) {
+        if (!socket_.is_open() && !command_socket_.is_open()) {
             std::cerr << "Socket not open; cannot request detector info" << std::endl;
             return info;
         }
 
         try {
-            std::lock_guard<std::mutex> resp_lock(response_mutex_);
-            std::lock_guard<std::mutex> lock(socket_mutex_);
-            char cmd = 'd';
-            boost::asio::write(socket_, boost::asio::buffer(&cmd, 1));
+            std::lock_guard<std::mutex> command_lock(command_mutex_);
 
-            // Read response: char[4] + double(8) + int(4) + int(4) + int(4) + int(4) = 28 bytes
-            std::vector<char> response(28);
-            if (!readExactlyWithTimeout(socket_, response.data(), response.size(), 3000)) {
-                std::cerr << "Timed out waiting for detector info response" << std::endl;
-            } else {
-                std::string serial(response.data(), 4);
+            // Detector-info frame layout (28 bytes, little-endian):
+            //   [0..3]   char[4] serial_number (e.g. "G596")
+            //   [4..11]  float64 temperature
+            //   [12..15] int32   bias_status (0 or 1)
+            //   [16..19] int32   line_power_status (0 or 1)
+            //   [20..23] int32   batt1_percent
+            //   [24..27] int32   batt2_percent
+            constexpr size_t FRAME_BYTES = 28;
+
+            auto decode_detector_info = [&](const char *base) {
+                DetectorInfo decoded;
+                std::string serial(base, 4);
                 serial.erase(std::find(serial.begin(), serial.end(), '\0'), serial.end());
+                decoded.serial_number = serial;
+                decoded.detector_temp_kelvin = readF64(base + 4, false);
+                decoded.detector_bias_status = readI32(base + 12, false);
+                decoded.line_power_status = readI32(base + 16, false);
+                decoded.batt1_percent = readI32(base + 20, false);
+                decoded.batt2_percent = readI32(base + 24, false);
+                return decoded;
+            };
 
-                auto decode_detector_info = [&](bool big_endian) {
-                    DetectorInfo decoded;
-                    decoded.serial_number = serial;
-                    // Temperature stored as-is from device (field name is legacy)
-                    decoded.detector_temp_kelvin = readF64(response.data() + 4, big_endian);
-                    decoded.detector_bias_status = readI32(response.data() + 12, big_endian);
-                    decoded.line_power_status = readI32(response.data() + 16, big_endian);
-                    decoded.batt1_percent = readI32(response.data() + 20, big_endian);
-                    decoded.batt2_percent = readI32(response.data() + 24, big_endian);
-                    return decoded;
-                };
+            auto plausible_detector_info = [](const DetectorInfo &c) {
+                // Serial must be printable alphanumeric (e.g. "G596")
+                if (c.serial_number.empty() || c.serial_number.size() > 4) return false;
+                for (char ch : c.serial_number) {
+                    if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-')
+                        return false;
+                }
+                // First char should be a letter (detector model prefix)
+                if (!std::isalpha(static_cast<unsigned char>(c.serial_number[0])))
+                    return false;
+                if (!std::isfinite(c.detector_temp_kelvin)) return false;
+                if (c.detector_temp_kelvin < -50.0 || c.detector_temp_kelvin > 200.0) return false;
+                if (c.detector_bias_status != 0 && c.detector_bias_status != 1) return false;
+                if (c.line_power_status != 0 && c.line_power_status != 1) return false;
+                if (c.batt1_percent < 0 || c.batt1_percent > 100) return false;
+                if (c.batt2_percent < 0 || c.batt2_percent > 100) return false;
+                return true;
+            };
 
-                auto plausible_detector_info = [](const DetectorInfo &candidate) {
-                    return !candidate.serial_number.empty()
-                           && std::isfinite(candidate.detector_temp_kelvin)
-                           && candidate.detector_temp_kelvin >= -50.0
-                           && candidate.detector_temp_kelvin <= 200.0
-                           && (candidate.detector_bias_status == 0 || candidate.detector_bias_status == 1)
-                           && (candidate.line_power_status == 0 || candidate.line_power_status == 1)
-                           && candidate.batt1_percent >= 0
-                           && candidate.batt1_percent <= 100
-                           && candidate.batt2_percent >= 0
-                           && candidate.batt2_percent <= 100;
-                };
+            bool found = false;
+            std::vector<char> last_buffer;
 
-                const auto little_endian = decode_detector_info(false);
-                const auto big_endian = decode_detector_info(true);
-                if (plausible_detector_info(little_endian)) {
-                    info = little_endian;
-                } else if (plausible_detector_info(big_endian)) {
-                    info = big_endian;
-                } else {
-                    info = little_endian;
+            // Use command socket first (receives events + responses), then stream
+            std::vector<std::pair<boost::asio::ip::tcp::socket *, std::string>> channels;
+            if (command_socket_.is_open()) {
+                channels.emplace_back(&command_socket_, "command");
+            }
+            if (socket_.is_open()) {
+                channels.emplace_back(&socket_, "stream");
+            }
+
+            // Command 'd' = "Requests Detector Status Info" (the only valid
+            // form; 'D' is undefined in the GeGI protocol).
+            const std::array<char, 1> cmds{{'d'}};
+            for (const auto &channel : channels) {
+                boost::asio::ip::tcp::socket &response_socket = *channel.first;
+                const bool using_stream_socket = (&response_socket == &socket_);
+
+                std::unique_lock<std::mutex> resp_lock(response_mutex_, std::defer_lock);
+                std::unique_lock<std::mutex> event_lock(socket_mutex_, std::defer_lock);
+                if (using_stream_socket) {
+                    resp_lock.lock();
+                    event_lock.lock();
+                }
+
+                for (char cmd : cmds) {
+                    for (int attempt = 0; attempt < 3 && !found; ++attempt) {
+                        const auto deadline = std::chrono::steady_clock::now()
+                                              + std::chrono::milliseconds(2000);
+                        auto buffer = sendAndAccumulateRaw(
+                            response_socket, cmd, deadline, 16384);
+
+                        // Scan buffer for a valid detector-info frame
+                        if (buffer.size() >= FRAME_BYTES) {
+                            for (size_t i = 0; i + FRAME_BYTES <= buffer.size(); ++i) {
+                                auto candidate = decode_detector_info(buffer.data() + i);
+                                if (plausible_detector_info(candidate)) {
+                                    info = candidate;
+                                    found = true;
+                                    std::cout << "Found detector-info at offset " << i
+                                              << " in " << buffer.size() << " bytes ("
+                                              << channel.second << ")" << std::endl;
+                                    break;
+                                }
+                            }
+                        }
+                        last_buffer = buffer;
+                    }
+                    if (found) break;
+                }
+                if (found) break;
+            }
+
+            if (!found) {
+                std::cerr << "Timed out waiting for valid detector info response" << std::endl;
+                if (!last_buffer.empty()) {
+                    const size_t n = std::min<size_t>(last_buffer.size(), 64);
+                    std::ostringstream oss;
+                    oss << std::hex << std::setfill('0');
+                    for (size_t i = 0; i < n; ++i) {
+                        oss << std::setw(2)
+                            << (static_cast<unsigned int>(
+                                static_cast<unsigned char>(last_buffer[i])));
+                    }
+                    std::cerr << "Detector info debug: captured "
+                              << last_buffer.size() << " bytes, first " << n
+                              << " hex=" << oss.str() << std::endl;
                 }
             }
 
