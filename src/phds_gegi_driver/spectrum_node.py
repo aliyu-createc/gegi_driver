@@ -138,12 +138,23 @@ class SpectrumNode(object):
         msg.deadTime_ms = self._get_dead_time_ms(period_ms)
         msg.endTime = rospy.Time.now()
 
-        with self.lock:
-            msg.spectrum = self.spectrum.tolist()
-            msg.totalCount = int(self.spectrum.sum())
-            self.spectrum[:] = 0
+        msg.spectrum, msg.totalCount = self._snapshot_and_reset()
 
         self.pub.publish(msg)
+
+    def _snapshot_and_reset(self):
+        """Return the counts accumulated since the last publish, and zero them.
+
+        CONTRACT: /spectrum carries per-interval DELTAS, not a running total.
+        The data recorder ADDS each message into the spectrum it saves, so
+        publishing a cumulative histogram here would make every saved N42
+        over-count. Keep this a delta. (Unit-tested.)
+        """
+        with self.lock:
+            counts = self.spectrum.tolist()
+            total = int(self.spectrum.sum())
+            self.spectrum[:] = 0
+        return counts, total
 
     def _get_dead_time_ms(self, period_ms):
         """Non-blocking: convert the latest cached dead-time % to milliseconds.

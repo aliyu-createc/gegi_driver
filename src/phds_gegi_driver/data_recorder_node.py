@@ -25,6 +25,7 @@ Services:
 from __future__ import print_function
 
 import csv
+import math
 import os
 import threading
 import time
@@ -86,6 +87,113 @@ def gamma_constant_for(table, iso_name, default=0.077):
     return default
 
 
+def _median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return ordered[mid] if n % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def aggregate_run_activity(activity_reports, drop_threshold=0.75):
+    """Collapse the per-counting-window activity reports into ONE result per
+    gamma line for the whole run.
+
+    Activity is computed from TOTAL net counts / TOTAL live time, not by
+    averaging the per-window activities: that weights the windows correctly and
+    is the statistically right estimator for the run.
+
+    Partial start-up windows are EXCLUDED. The first window of a run often
+    captures only a few seconds of data but is logged with a FULL live time, so
+    including it drags the activity LOW (measured at -6.8% on a real run).
+
+    The test is on COUNT RATE, not raw counts: a ramp window has partial counts
+    against a full live time, so its rate is anomalously low, while a genuinely
+    shorter window has fewer counts but a NORMAL rate and must be kept. Any
+    window whose net rate falls below `drop_threshold` x the run median rate is
+    dropped.
+
+    Returns {line_label: {activity_MBq, counting_sigma_MBq, net_counts,
+                          live_time_s, windows_used, windows_dropped, ...}}.
+    """
+    per_line = {}
+    for report in activity_reports:
+        live = float(report.get('live_time_s', 0.0) or 0.0)
+        for iso in report.get('isotopes', []):
+            name = iso.get('isotope', '')
+            if not name or not iso.get('valid'):
+                continue
+            net = float(iso.get('net_corrected', 0.0) or 0.0)
+            act = float(iso.get('activity_MBq', 0.0) or 0.0)
+            if net <= 0 or live <= 0 or act <= 0:
+                continue
+            per_line.setdefault(name, []).append({
+                'net': net, 'live': live, 'act': act,
+                'energy_keV': float(iso.get('energy_keV', 0.0) or 0.0),
+            })
+
+    results = {}
+    for name, windows in per_line.items():
+        median_rate = _median([w['net'] / w['live'] for w in windows])
+        kept = [w for w in windows
+                if median_rate <= 0
+                or (w['net'] / w['live']) >= drop_threshold * median_rate]
+        dropped = len(windows) - len(kept)
+        if not kept:
+            continue
+        total_net = sum(w['net'] for w in kept)
+        total_live = sum(w['live'] for w in kept)
+        if total_net <= 0 or total_live <= 0:
+            continue
+        # Bq per cps is a geometry/efficiency constant for the run; take the
+        # median across windows so one odd window cannot skew the scale.
+        bq_per_cps = _median([w['act'] / (w['net'] / w['live']) for w in kept])
+        activity = bq_per_cps * (total_net / total_live)
+        results[name] = {
+            'isotope': name,
+            'energy_keV': kept[0]['energy_keV'],
+            'activity_MBq': activity,
+            # Counting statistics ONLY - not the assay uncertainty.
+            'counting_sigma_MBq': activity / math.sqrt(total_net),
+            'net_counts': total_net,
+            'live_time_s': total_live,
+            'windows_used': len(kept),
+            'windows_dropped': dropped,
+        }
+    return results
+
+
+def group_by_radionuclide(line_results, radionuclide_of):
+    """Combine per-line results into one result per radionuclide.
+
+    Co-60 is measured on two photopeaks (1173 and 1332 keV) that quantify the
+    SAME nuclide, so they are averaged into a single Co-60 activity. Their
+    spread is reported: it is a direct internal-consistency check.
+    """
+    groups = {}
+    for name, res in line_results.items():
+        groups.setdefault(radionuclide_of(name), []).append(res)
+
+    out = {}
+    for nuclide, results in groups.items():
+        activities = [r['activity_MBq'] for r in results]
+        activity = sum(activities) / len(activities)
+        sigma = math.sqrt(sum(r['counting_sigma_MBq'] ** 2 for r in results)) / len(results)
+        spread = 0.0
+        if len(activities) > 1 and activity > 0:
+            spread = 100.0 * (max(activities) - min(activities)) / activity
+        out[nuclide] = {
+            'radionuclide': nuclide,
+            'activity_MBq': activity,
+            'counting_sigma_MBq': sigma,
+            'line_spread_percent': spread,
+            'lines': sorted(r['isotope'] for r in results),
+            'net_counts': sum(r['net_counts'] for r in results),
+        }
+    return out
+
+
 class DataRecorderNode(object):
     def __init__(self):
         self.output_dir = rospy.get_param("~output_dir", "/opt/phds_gegi_driver/data")
@@ -104,6 +212,27 @@ class DataRecorderNode(object):
         # so the database can link the N42, activity peak rows and heatmaps of a
         # run back to one parent Measurement (spec DB-GEGI-002 / DB-GEGI-004).
         self.measurement_id_prefix = rospy.get_param("~measurement_id_prefix", "GEGI")
+
+        # Systematic (non-counting) assay uncertainty, 1 sigma, in percent. This is
+        # the position-dominated part of the uncertainty budget and is a property of
+        # the METHOD, not of an individual run (see docs/DJR_assay_results_wording.md).
+        #
+        # The N42 activity uncertainty is built per run as
+        #     u_combined = sqrt(u_counting^2 + u_systematic^2),  U(k=2) = 2*u_combined
+        # so a well-counted run reports ~the budget value, while a marginal run near
+        # the MDA correctly reports a much wider uncertainty. Writing the counting
+        # sigma alone (~1-3%) into a durable record would badly understate the real
+        # measurement uncertainty; a reader reasonably assumes the quoted figure IS
+        # the measurement uncertainty.
+        #
+        # It is a parameter, not a constant, because the budget is rig-specific.
+        #
+        # Default 10.6% = RSS of: position 10.2 (Exp E), repeatability 2.1 (Exp D),
+        # certificate 1.5 (Co-60 BH-4103: 3% expanded at k=2 -> 1.5% standard),
+        # efficiency transfer 1.1 (Exp B), shielding 1.0 (Exp F), dead-time 0.6
+        # (Exp C), Co-60 coincidence summing 0.05. -> expanded U(k=2) ~= 21.3%.
+        self.assay_systematic_uncertainty_pct = rospy.get_param(
+            "~assay_systematic_uncertainty_percent", 10.6)
 
         # Ensure output dir exists
         if not os.path.exists(self.output_dir):
@@ -366,9 +495,10 @@ class DataRecorderNode(object):
             bag.close()
             rospy.loginfo("  Bag saved: %s_compton_events.bag", prefix)
 
-        # Save spectrum as N42
+        # Save spectrum as N42, with the run's activity results embedded so the
+        # N42 is a complete standards-compliant record (spectrum + activities).
         self._save_n42(prefix, spectrum, real_time_ms, live_time_ms,
-                       measurement_id, reference_datetime)
+                       measurement_id, reference_datetime, activities)
 
         # Save heatmap raw points CSV (irregular, per-isotope scores)
         try:
@@ -561,12 +691,87 @@ class DataRecorderNode(object):
             except (ValueError, TypeError):
                 pass
 
+    def _build_analysis_results_xml(self, activities, measurement_id):
+        """Build the N42 <AnalysisResults> block: the run-level nuclide activities.
+
+        N42.42 has native elements for nuclide activity results, so the spectrum
+        and the activities derived from it travel together in one standards
+        compliant record instead of being split across an N42 + a bespoke CSV.
+
+        Activities are aggregated over the run (total net counts / total live
+        time, partial start-up windows excluded) and reported per RADIONUCLIDE:
+        Co-60's two photopeaks quantify the same nuclide and are averaged.
+        """
+        lines = aggregate_run_activity(activities)
+        if not lines:
+            return ""
+        nuclides = group_by_radionuclide(lines, self._controlled_radionuclide)
+        u_sys = self.assay_systematic_uncertainty_pct
+
+        nuclide_xml = []
+        for name in sorted(nuclides):
+            res = nuclides[name]
+            activity_bq = res['activity_MBq'] * 1.0e6
+            u_count = (100.0 * res['counting_sigma_MBq'] / res['activity_MBq']
+                       if res['activity_MBq'] > 0 else 0.0)
+            u_expanded = 2.0 * math.sqrt(u_count ** 2 + u_sys ** 2)   # k=2
+            nuclide_xml.append(
+                '      <Nuclide>\n'
+                '        <NuclideIdentifiedIndicator>true</NuclideIdentifiedIndicator>\n'
+                '        <NuclideName>{name}</NuclideName>\n'
+                '        <NuclideActivityValue units="Bq">{act:.6g}</NuclideActivityValue>\n'
+                '        <NuclideActivityUncertaintyValue>{unc:.6g}</NuclideActivityUncertaintyValue>\n'
+                '        <Remark>Lines: {lines}. Counting u={uc:.2f}% (1sigma); '
+                'systematic u={us:.2f}% (1sigma); expanded U={ue:.1f}% (k=2). '
+                'Line spread {spread:.2f}%.</Remark>\n'
+                '      </Nuclide>'.format(
+                    name=name, act=activity_bq,
+                    unc=activity_bq * u_expanded / 100.0,
+                    lines=" ".join(res['lines']), uc=u_count, us=u_sys,
+                    ue=u_expanded, spread=res['line_spread_percent']))
+
+        peak_xml = []
+        for label in sorted(lines):
+            res = lines[label]
+            cps = (res['net_counts'] / res['live_time_s']
+                   if res['live_time_s'] > 0 else 0.0)
+            peak_xml.append(
+                '      <Peak>\n'
+                '        <PeakEnergyValue units="keV">{e:.2f}</PeakEnergyValue>\n'
+                '        <PeakNetAreaValue>{net:.1f}</PeakNetAreaValue>\n'
+                '        <PeakNetCountRateValue units="cps">{cps:.4f}</PeakNetCountRateValue>\n'
+                '        <Remark>{label}: {used} window(s) used, {dropped} partial '
+                'window(s) excluded; live time {live:.1f} s.</Remark>\n'
+                '      </Peak>'.format(
+                    e=res['energy_keV'], net=res['net_counts'], cps=cps,
+                    label=label, used=res['windows_used'],
+                    dropped=res['windows_dropped'], live=res['live_time_s']))
+
+        ref = (' radMeasurementReferences="{}"'.format(measurement_id)
+               if measurement_id else '')
+        return (
+            '  <AnalysisResults{ref}>\n'
+            '    <Remark>Activities derived from the accumulated spectrum of this '
+            'measurement. The quoted NuclideActivityUncertaintyValue is the EXPANDED '
+            'uncertainty (k=2, 95%), combining per-run counting statistics with the '
+            'systematic assay uncertainty ({us:.1f}% 1sigma, dominated by source '
+            'position within the tray). It is NOT counting statistics alone.</Remark>\n'
+            '    <NuclideAnalysisResults>\n{nuclides}\n'
+            '    </NuclideAnalysisResults>\n'
+            '    <PeakAnalysisResults>\n{peaks}\n'
+            '    </PeakAnalysisResults>\n'
+            '  </AnalysisResults>\n'.format(
+                ref=ref, us=u_sys,
+                nuclides="\n".join(nuclide_xml), peaks="\n".join(peak_xml)))
+
     def _save_n42(self, prefix, spectrum, real_time_ms, live_time_ms,
-                  measurement_id="", reference_datetime=""):
+                  measurement_id="", reference_datetime="", activities=None):
         """Save spectrum in ANSI N42.42 XML format.
 
         The measurement_id is stamped onto <RadMeasurement id=...> so the raw
         N42 asset is linkable back to the parent Measurement (spec DB-GEGI-004).
+        When activity results are supplied they are embedded as <AnalysisResults>,
+        making the N42 a complete, self-describing record of the measurement.
         """
         filepath = os.path.join(self.output_dir, "{}_spectrum.n42".format(prefix))
 
@@ -616,7 +821,7 @@ class DataRecorderNode(object):
       <ChannelData compressionCode="None">{spectrum_data}</ChannelData>
     </Spectrum>
   </RadMeasurement>
-</RadInstrumentData>
+{analysis_results}</RadInstrumentData>
 """.format(
             offset=offset,
             gain=gain,
@@ -624,7 +829,9 @@ class DataRecorderNode(object):
             live_time=live_time_s,
             spectrum_data=spectrum_text,
             measurement_id=measurement_id,
-            reference_datetime=reference_datetime
+            reference_datetime=reference_datetime,
+            analysis_results=self._build_analysis_results_xml(
+                activities or [], measurement_id)
         )
 
         with open(filepath, 'w') as f:

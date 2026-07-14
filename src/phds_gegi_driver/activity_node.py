@@ -69,6 +69,27 @@ def gegi_solid_angle_fraction(distance_m, crystal_radius_m=GEGI_CRYSTAL_RADIUS_M
     return 0.5 * (1.0 - distance_m / math.sqrt(d2 + r2))
 
 
+def shield_transmission(mu_shield_per_m, total_plates, plate_thickness_m):
+    """Fraction of gammas transmitted through `total_plates` shielding plates.
+
+    transmission = exp(-mu * total_plates * plate_thickness). Returns 1.0 (no
+    attenuation) when there is no shielding or no attenuation coefficient.
+    Pure function so the shielding physics is unit-testable.
+    """
+    total_thickness = total_plates * plate_thickness_m
+    if total_thickness <= 0 or mu_shield_per_m <= 0:
+        return 1.0
+    return math.exp(-mu_shield_per_m * total_thickness)
+
+
+def plate_derived_distance(base_standoff_m, total_plates, plate_thickness_m):
+    """Source-to-detector distance with `total_plates` in the beam.
+
+    Each plate displaces the source by its thickness from the bare standoff.
+    """
+    return base_standoff_m + total_plates * plate_thickness_m
+
+
 def gegi_intrinsic_efficiency(energy_keV):
     """Compute GeGI intrinsic FEP efficiency at a given energy (keV).
 
@@ -287,9 +308,8 @@ class ActivityNode(object):
         base standoff > 0); otherwise the static source_distance_m is kept.
         """
         if self.plate_thickness_m > 0 and self.base_standoff_m > 0:
-            self.source_distance_m = (
-                self.base_standoff_m
-                + self._total_plates() * self.plate_thickness_m)
+            self.source_distance_m = plate_derived_distance(
+                self.base_standoff_m, self._total_plates(), self.plate_thickness_m)
 
     def _publish_distance(self):
         """Broadcast the effective source distance to dose/imaging consumers."""
@@ -300,10 +320,8 @@ class ActivityNode(object):
 
     def _shield_transmission(self, iso):
         """Fraction of this isotope's gammas transmitted through the plates."""
-        total_thickness = self._total_plates() * self.plate_thickness_m
-        if total_thickness <= 0 or iso.mu_shield_per_m <= 0:
-            return 1.0
-        return math.exp(-iso.mu_shield_per_m * total_thickness)
+        return shield_transmission(
+            iso.mu_shield_per_m, self._total_plates(), self.plate_thickness_m)
 
     def _on_distance(self, msg):
         """Callback for dynamic distance updates (std_msgs/Float64, metres)."""

@@ -171,6 +171,16 @@ class LiveSpectrumPlotter(object):
                     ax_cum.set_ylim(0.5, None)
                     ax_snap.set_ylim(0.5, None)
                 fig.canvas.draw_idle()
+            elif event.key == 'c':
+                # Clear the DISPLAY accumulation only (client-side). Does not touch
+                # the detector or any recording - /spectrum is per-interval deltas.
+                with self.lock:
+                    self.counts_cumulative[:] = 0
+                    self.new_data = True
+                with self.singles_lock:
+                    self.counts_singles[:] = 0
+                    self.new_singles_data = True
+                print("Display spectrum cleared (c).")
 
         fig.canvas.mpl_connect('key_press_event', on_key)
 
