@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <launch>
     <!-- Standalone spectrum node. Subscribes to /energy_deposit, publishes /spectrum. -->
-    <arg name="calibration_file" default="$(find phds_gegi_driver)/config/EnergyCal.csv"/>
+    <arg name="calibration_file" default="$(find phds_gegi_driver)/config/EnergyCal_15000_0p2keV.csv"/>
     <arg name="publish_rate_hz" default="4.0"/>
     <arg name="energy_topic" default="/energy_deposit"/>
     <arg name="spectrum_topic" default="/spectrum"/>

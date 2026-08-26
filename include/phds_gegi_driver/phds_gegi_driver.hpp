@@ -46,6 +46,11 @@ namespace phds_gegi_driver {
                                    phds_gegi_driver::StopAcquisition::Response &res);
         bool handleClearData(phds_gegi_driver::ClearData::Request &req,
                             phds_gegi_driver::ClearData::Response &res);
+        // Full onboard clear ('x' = data AND windows). The plain 'c' clear
+        // leaves detector-side state that can ride into the next acquisition
+        // (stale-spectrum phantoms observed 2026-08-26).
+        bool handleClearDataAndWindows(phds_gegi_driver::ClearData::Request &req,
+                                       phds_gegi_driver::ClearData::Response &res);
         bool handleGetRunInfo(phds_gegi_driver::GetRunInfo::Request &req,
                              phds_gegi_driver::GetRunInfo::Response &res);
         bool handleGetDetectorInfo(phds_gegi_driver::GetDetectorInfo::Request &req,
@@ -67,6 +72,7 @@ namespace phds_gegi_driver {
         ros::ServiceServer start_acq_service_;
         ros::ServiceServer stop_acq_service_;
         ros::ServiceServer clear_data_service_;
+        ros::ServiceServer clear_data_windows_service_;
         ros::ServiceServer run_info_service_;
         ros::ServiceServer detector_info_service_;
         ros::ServiceServer toggle_bias_service_;

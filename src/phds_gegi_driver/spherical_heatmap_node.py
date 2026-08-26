@@ -80,6 +80,47 @@ def gamma_constant_for(table, iso_name, default=0.077):
     return default
 
 
+def parse_identified_msg(text):
+    """Parse the /identified_isotopes String ("Eu-152:0.83|Cs-137:1.00" or
+    "none") into a list of nuclide names. Pure function."""
+    names = []
+    for part in (text or '').split('|'):
+        part = part.strip()
+        if not part or part == 'none':
+            continue
+        names.append(part.rsplit(':', 1)[0].strip())
+    return names
+
+
+def identified_bands(names, library_nuclides, window_kev=30.0, defaults=None):
+    """Imaging energy bands: the Cs/Co defaults plus one band per identified
+    library nuclide, centred on its representative line. Pure function.
+
+    The screening layer (data_recorder) publishes which nuclides are present;
+    this turns them into Compton-imaging bands so ANY identified isotope gets
+    its own hotspot image - not just the hard-coded Cs/Co pair. Names missing
+    from the library (or already in the defaults) are ignored.
+
+    A nuclide may override the band via `imaging_keV` / `imaging_window_kev`
+    in the library: imaging wants EVENTS, so a multi-line nuclide can image a
+    wide band over a line CLUSTER (e.g. Eu-152's 964+1086+1112 keV, ~38% of
+    decays) instead of its single representative line.
+    """
+    bands = dict(defaults if defaults is not None else ISOTOPE_PEAKS)
+    for name in names or []:
+        if name in bands:
+            continue
+        nuc = (library_nuclides or {}).get(name)
+        if not nuc:
+            continue
+        centre = float(nuc.get('imaging_keV',
+                               nuc.get('representative_keV', 0.0)) or 0.0)
+        window = float(nuc.get('imaging_window_kev', window_kev) or window_kev)
+        if centre > 0.0:
+            bands[name] = {'energy': centre, 'window': window}
+    return bands
+
+
 def identify_isotope(energies_kev):
     """Identify the best-matching isotope from event energies near a peak.
     Returns (isotope_name, confidence) or (None, 0) if no clear match."""
@@ -116,6 +157,25 @@ class SphericalHeatmapNode(object):
         # Dose-rate gamma constants, single-sourced from isotopes.yaml.
         self.isotopes_config = rospy.get_param("~isotopes_config", "")
         self.gamma_constants = load_gamma_constants(self.isotopes_config)
+
+        # Nuclide ID library (nuclide_library.yaml): lets the imaging bands
+        # follow whatever the screening layer identifies (/identified_isotopes
+        # from the data recorder) instead of only the hard-coded Cs/Co pair.
+        self._library_nuclides = {}
+        self._identified_names = []
+        self.id_band_window_kev = float(
+            rospy.get_param("~id_band_window_kev", 30.0))
+        lib_path = rospy.get_param("~nuclide_library", "")
+        if lib_path:
+            try:
+                with open(lib_path) as f:
+                    self._library_nuclides = (
+                        yaml.safe_load(f) or {}).get('nuclides', {}) or {}
+                rospy.loginfo("Heatmap: %d ID-library nuclides for dynamic "
+                              "imaging bands", len(self._library_nuclides))
+            except Exception as e:
+                rospy.logwarn("Heatmap: could not load nuclide library %s: %s",
+                              lib_path, e)
 
         self.radius = rospy.get_param("~radius", 0.5)  # 1m diameter
         self.n_points = int(rospy.get_param("~n_points", 8000))
@@ -183,6 +243,10 @@ class SphericalHeatmapNode(object):
         self.raster_fov_m = rospy.get_param("~raster_fov_m", 0.5)  # +/-0.5m coverage
 
         self.sub = rospy.Subscriber("/compton_event", ComptonEvent, self.on_event, queue_size=10000)
+        # Screening-layer identifications (latched by the recorder); drives
+        # the dynamic imaging bands via _imaging_bands().
+        self.sub_identified = rospy.Subscriber(
+            "/identified_isotopes", String, self._on_identified, queue_size=2)
         self.pub_cloud = rospy.Publisher("/sphere_heatmap", PointCloud2, queue_size=2)
         self.pub_peak = rospy.Publisher("/source_direction", PoseStamped, queue_size=2)
         self.pub_peaks = rospy.Publisher("/source_directions", PoseArray, queue_size=2)
@@ -247,6 +311,20 @@ class SphericalHeatmapNode(object):
                 self._dose_rate_uSv_h = dose_rates
         except (ValueError, TypeError):
             pass
+
+    def _on_identified(self, msg):
+        """Screening-layer identifications arrived (recorder's periodic pass)."""
+        names = parse_identified_msg(msg.data)
+        if names != self._identified_names:
+            self._identified_names = names
+            rospy.loginfo("Heatmap imaging bands now: %s",
+                          ", ".join(sorted(self._imaging_bands())))
+
+    def _imaging_bands(self):
+        """Current energy bands to image: Cs/Co defaults + identified nuclides."""
+        return identified_bands(self._identified_names,
+                                self._library_nuclides,
+                                self.id_band_window_kev)
 
     def on_event(self, msg):
         if msg.cone_angle_uncertainty <= 0.0 or msg.cone_angle_uncertainty > self.max_uncertainty:
@@ -645,7 +723,7 @@ class SphericalHeatmapNode(object):
         # Find peaks per isotope energy band. Collect raw candidates first, then
         # apply temporal persistence to drop flickering ghost peaks before publish.
         raw_candidates = []
-        for iso_name, iso_info in ISOTOPE_PEAKS.items():
+        for iso_name, iso_info in self._imaging_bands().items():
             # Band-filter this isotope's events once.
             e_lo = iso_info['energy'] - iso_info['window']
             e_hi = iso_info['energy'] + iso_info['window']
@@ -718,7 +796,7 @@ class SphericalHeatmapNode(object):
             dose_rates = dict(self._dose_rate_uSv_h)
 
         iso_norm_scores = {}
-        for iso_name, iso_info in ISOTOPE_PEAKS.items():
+        for iso_name, iso_info in self._imaging_bands().items():
             iso_scores, iso_count = self._solve_energy_filtered(
                 events, iso_info['energy'], iso_info['window'])
             if iso_count >= 5:

@@ -34,9 +34,18 @@
     <!-- Isotope config: source of the dose-rate gamma constants (single source
          of truth, shared with the activity and data-recorder nodes). -->
     <arg name="isotopes_config" default="$(find phds_gegi_driver)/config/isotopes.yaml"/>
+    <!-- Nuclide ID library: identified isotopes (/identified_isotopes from the
+         data recorder's screening layer) get their own imaging band, centred on
+         the representative line +- id_band_window_kev, in addition to the
+         built-in Cs/Co bands. -->
+    <arg name="nuclide_library" default="$(find phds_gegi_driver)/config/nuclide_library.yaml"/>
+    <arg name="id_band_window_kev" default="30.0"/>
 
     <node name="spherical_heatmap" pkg="phds_gegi_driver" type="spherical_heatmap_node.py" output="screen">
         <param name="isotopes_config" value="$(arg isotopes_config)" />
+        <param name="nuclide_library" value="$(arg nuclide_library)" />
+        <param name="id_band_window_kev" type="double" value="$(arg id_band_window_kev)" />
+        <param name="support_ratio" type="double" value="$(arg support_ratio)" />
         <param name="radius" type="double" value="$(arg radius)" />
         <param name="n_points" type="int" value="$(arg n_points)" />
         <param name="window_s" type="double" value="$(arg window_s)" />

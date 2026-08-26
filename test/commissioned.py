@@ -13,14 +13,16 @@ config/isotopes.yaml (a zeroed calibration factor, a mistyped standoff) fails a
 test instead of silently corrupting every reported activity.
 """
 
-# --- Geometry -------------------------------------------------------------
-BARE_STANDOFF_M = 0.325       # source -> crystal face with ZERO plates
-PLATE_THICKNESS_M = 0.005     # thickness of ONE plate (5 mm)
-BASE_SHIELD_PLATES = 1        # permanently mounted plates, always in the beam
-OPERATIONAL_STANDOFF_M = 0.330  # = BARE + BASE_SHIELD_PLATES * PLATE_THICKNESS
+# --- Geometry (2026-08-06 rig: 580 mm, plywood table + permanent steel plate) --
+# The permanent 11 mm plywood + 5 mm steel plate are absorbed into the calibration
+# (calibrate-in-place), so BASE_SHIELD_PLATES = 0: only EXTRA plates are corrected.
+BARE_STANDOFF_M = 0.580       # measured face-to-source with 0 EXTRA plates
+PLATE_THICKNESS_M = 0.005     # thickness of ONE extra plate (5 mm)
+BASE_SHIELD_PLATES = 0        # permanent plate is in the CF, not corrected
+OPERATIONAL_STANDOFF_M = 0.580  # = BARE + BASE_SHIELD_PLATES * PLATE_THICKNESS
 
 CRYSTAL_RADIUS_M = 0.045      # GeGi 90 mm diameter crystal
-CALIBRATION_DISTANCE_M = 0.5  # where the calibration factors were measured
+CALIBRATION_DISTANCE_M = 0.580  # calibration = operational geometry (in-place)
 
 # --- Shielding ------------------------------------------------------------
 SHIELD_MATERIAL = 'steel'

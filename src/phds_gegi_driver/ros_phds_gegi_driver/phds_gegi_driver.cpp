@@ -40,6 +40,20 @@ namespace phds_gegi_driver {
         getParam(pn, "detector_frame", detector_frame_);
         getParam(pn, "detector_info_cache_max_age_sec", detector_info_cache_max_age_sec_);
 
+        // Energy-scale correction (E_true = c0 + c1*E + c2*E^2) applied to
+        // every parsed site energy. The detector's onboard event-energy
+        // calibration reads ~0.057% high (+1.0 keV at 1332 keV); coefficients
+        // fitted from a 10-line Cs/Co/Eu run (tools/fit_energy_cal.py).
+        // Defaults are identity - the launch file supplies the fitted values.
+        double energy_cal_c0 = 0.0;
+        double energy_cal_c1 = 1.0;
+        double energy_cal_c2 = 0.0;
+        getParam(pn, "energy_cal_c0", energy_cal_c0);
+        getParam(pn, "energy_cal_c1", energy_cal_c1);
+        getParam(pn, "energy_cal_c2", energy_cal_c2);
+        tcp_event_reader_.setEnergyCorrection(energy_cal_c0, energy_cal_c1,
+                                              energy_cal_c2);
+
         // Deep publisher queues so bursts of events are never dropped between
         // the reader thread and slower subscribers (spectrum/heatmap/recorder).
         // Small Float64/ComptonEvent messages make a large queue cheap.
@@ -63,6 +77,8 @@ namespace phds_gegi_driver {
                                                 &PhdsGegiDriver::handleStopAcquisition, this);
         clear_data_service_ = n.advertiseService("detector/clear_data",
                                                   &PhdsGegiDriver::handleClearData, this);
+        clear_data_windows_service_ = n.advertiseService("detector/clear_data_and_windows",
+                                &PhdsGegiDriver::handleClearDataAndWindows, this);
         run_info_service_ = n.advertiseService("detector/get_run_info",
                                                 &PhdsGegiDriver::handleGetRunInfo, this);
         detector_info_service_ = n.advertiseService("detector/get_detector_info",
@@ -148,6 +164,15 @@ namespace phds_gegi_driver {
         ROS_INFO("Received clear_data request");
         res.success = tcp_event_reader_.sendClearData();
         res.message = res.success ? "Clear data command sent" : "Failed to send clear data command";
+        return true;
+    }
+
+    bool PhdsGegiDriver::handleClearDataAndWindows(phds_gegi_driver::ClearData::Request &req,
+                                                   phds_gegi_driver::ClearData::Response &res) {
+        ROS_INFO("Received clear_data_and_windows request (full onboard clear)");
+        res.success = tcp_event_reader_.sendClearDataAndWindows();
+        res.message = res.success ? "Clear data+windows command sent"
+                                  : "Failed to send clear data+windows command";
         return true;
     }
 

@@ -25,10 +25,12 @@ Services:
 from __future__ import print_function
 
 import csv
+import json
 import math
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -40,6 +42,15 @@ from geometry_msgs.msg import PoseArray
 from sensor_msgs.msg import PointCloud2
 from radiation_detector_msgs.msg import ComptonEvent, Spectrum
 from phds_gegi_driver.srv import StartTimedAcquisition, StartTimedAcquisitionRequest, GetRunInfo
+
+# Isotope-ID screening layer (matched-filter peak search + nuclide library
+# match). Optional: the recorder runs without it if the module or library is
+# missing. NOTE: sync.sh/build.sh must copy isotope_id.py into devel/lib
+# alongside the node files.
+try:
+    import isotope_id
+except ImportError:
+    isotope_id = None
 
 
 # Specific gamma-ray dose-rate constants (uSv*m^2 / MBq*h). The authoritative
@@ -96,40 +107,91 @@ def _median(values):
     return ordered[mid] if n % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
-def aggregate_run_activity(activity_reports, drop_threshold=0.75):
-    """Collapse the per-counting-window activity reports into ONE result per
-    gamma line for the whole run.
+def dead_time_correction_factor(real_time_s, live_time_s, dead_time_percent=None):
+    """Multiplier that converts a RAW net area/activity to a DEAD-TIME-CORRECTED one.
 
-    Activity is computed from TOTAL net counts / TOTAL live time, not by
-    averaging the per-window activities: that weights the windows correctly and
-    is the statistically right estimator for the run.
+    The detector's live-time clock already excludes dead time, so real/live is
+    the exact correction and is preferred. If the real/live counters are missing
+    or nonsensical we fall back to the reported cumulative dead-time percentage,
+    and finally to 1.0 (no correction) so a bad run-info read can never fabricate
+    or destroy counts.
 
-    Partial start-up windows are EXCLUDED. The first window of a run often
-    captures only a few seconds of data but is logged with a FULL live time, so
-    including it drags the activity LOW (measured at -6.8% on a real run).
+    IMPORTANT (calibration coupling): the calibration_factor values in
+    isotopes.yaml were fitted against certificated sources using UNCORRECTED
+    activities, so they already absorb the ~2% dead time of the commissioning
+    runs. Turning this correction on therefore REQUIRES re-deriving the
+    calibration factors from dead-time-corrected commissioning data, otherwise
+    the ~2% is applied twice. See docs/PORTING.md and the recalibration step.
+    """
+    try:
+        rt = float(real_time_s)
+        lt = float(live_time_s)
+        if rt > 0.0 and lt > 0.0 and lt <= rt:
+            return rt / lt
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = float(dead_time_percent)
+        if 0.0 <= dt < 100.0:
+            return 1.0 / (1.0 - dt / 100.0)
+    except (TypeError, ValueError):
+        pass
+    return 1.0
 
-    The test is on COUNT RATE, not raw counts: a ramp window has partial counts
-    against a full live time, so its rate is anomalously low, while a genuinely
-    shorter window has fewer counts but a NORMAL rate and must be kept. Any
-    window whose net rate falls below `drop_threshold` x the run median rate is
-    dropped.
 
-    Returns {line_label: {activity_MBq, counting_sigma_MBq, net_counts,
-                          live_time_s, windows_used, windows_dropped, ...}}.
+def currie_critical_level(background_counts):
+    """Currie critical level L_C = 2.33*sqrt(B): the net-count DECISION threshold
+    (~95% confidence) above which a line is DETECTED. Background-aware, unlike a
+    fixed count gate."""
+    return 2.33 * math.sqrt(max(0.0, float(background_counts or 0.0)))
+
+
+def aggregate_run_activity(activity_reports, drop_threshold=0.75, dt_factor=1.0,
+                           background_rates=None):
+    """Collapse the per-window activity reports into ONE result per gamma line,
+    deciding DETECTION on the RUN-TOTAL net.
+
+    Detection is a run-level Currie decision: a line is detected when its total
+    net over the whole run exceeds L_C = 2.33*sqrt(B_total), NOT when individual
+    counting windows each clear a fixed count threshold. A weak line (e.g. Co-60's
+    1332 keV) that never crosses the per-window bar but accumulates ample counts
+    over the run is therefore still quantified. The activity node's per-window
+    ``valid`` flag is deliberately IGNORED here - it remains only a live-display
+    hint.
+
+    Activity is TOTAL net / TOTAL live time (correctly window-weighted), scaled by
+    the per-line efficiency product K reported by the activity node
+    (A_Bq = total_net/(K*total_live)); older/synthetic reports without K fall back
+    to the window activity/net scale.
+
+    Partial start-up windows are still EXCLUDED, on COUNT RATE: a ramp window has
+    partial counts against a full logged live time, so its rate is anomalously low
+    (including it dragged a real run -6.8%). A genuinely short window has a NORMAL
+    rate and is kept.
+
+    background_rates (optional) = {label: {net_cps, net_cps_sigma}} from a no-source
+    run: its net counts (rate x live) are subtracted per line, and its variance is
+    folded into the detection threshold AND the counting sigma. This removes both
+    the environmental peaks (e.g. ambient Cs-137) and the zero-background false
+    positives (an empty ROI no longer has L_C = 0).
+
+    Returns {line_label: {...}} for DETECTED lines only; undetected configured
+    lines are reported as MDAs by non_detected_nuclide_mdas().
     """
     per_line = {}
     for report in activity_reports:
         live = float(report.get('live_time_s', 0.0) or 0.0)
         for iso in report.get('isotopes', []):
             name = iso.get('isotope', '')
-            if not name or not iso.get('valid'):
-                continue
             net = float(iso.get('net_corrected', 0.0) or 0.0)
-            act = float(iso.get('activity_MBq', 0.0) or 0.0)
-            if net <= 0 or live <= 0 or act <= 0:
+            if not name or net <= 0 or live <= 0:
                 continue
             per_line.setdefault(name, []).append({
-                'net': net, 'live': live, 'act': act,
+                'net': net, 'live': live,
+                'gross': float(iso.get('gross_counts', 0.0) or 0.0),
+                'bg': float(iso.get('background_counts', 0.0) or 0.0),
+                'K': float(iso.get('efficiency_product', 0.0) or 0.0),
+                'act': float(iso.get('activity_MBq', 0.0) or 0.0),
                 'energy_keV': float(iso.get('energy_keV', 0.0) or 0.0),
             })
 
@@ -144,19 +206,50 @@ def aggregate_run_activity(activity_reports, drop_threshold=0.75):
             continue
         total_net = sum(w['net'] for w in kept)
         total_live = sum(w['live'] for w in kept)
+        total_bg = sum(w['bg'] for w in kept)
+        total_gross = sum(w['gross'] for w in kept)
         if total_net <= 0 or total_live <= 0:
             continue
-        # Bq per cps is a geometry/efficiency constant for the run; take the
-        # median across windows so one odd window cannot skew the scale.
-        bq_per_cps = _median([w['act'] / (w['net'] / w['live']) for w in kept])
-        activity = bq_per_cps * (total_net / total_live)
+
+        # Optional background subtraction (measured no-source rate).
+        bg_counts = 0.0     # expected background counts in this run's ROI
+        bg_var = 0.0        # variance of that from the background measurement
+        if background_rates and name in background_rates:
+            br = background_rates[name]
+            bg_counts = float(br.get('net_cps', 0.0) or 0.0) * total_live
+            bg_var = (float(br.get('net_cps_sigma', 0.0) or 0.0) * total_live) ** 2
+        net_source = total_net - bg_counts
+
+        # Run-level detection decision (Currie critical level). The subtracted
+        # background and its measurement variance widen L_C, so a clean ROI (which
+        # used to give L_C = 0) and ambient peaks no longer false-positive.
+        if net_source <= currie_critical_level(total_bg + bg_counts + bg_var):
+            continue
+        # Activity scale: prefer the reported efficiency product K (activity =
+        # net_source/(K*total_live)); fall back to the window activity/net ratio for
+        # reports predating it. dt_factor (real/live) scales the activity only -
+        # the Poisson statistics below use RAW counts.
+        ks = [w['K'] for w in kept if w['K'] > 0]
+        if ks:
+            activity = (net_source / (_median(ks) * total_live)) * dt_factor / 1.0e6
+        else:
+            ratios = [w['act'] / (w['net'] / w['live'])
+                      for w in kept if w['act'] > 0 and w['net'] > 0]
+            bq_per_cps = _median(ratios) if ratios else 0.0
+            activity = bq_per_cps * (net_source / total_live) * dt_factor
+        # Net-area sigma: Poisson on the raw counts (gross + sideband bg =
+        # net + 2*bg) plus the background-subtraction variance.
+        sigma_net = math.sqrt(total_net + 2.0 * total_bg + bg_var)
         results[name] = {
             'isotope': name,
             'energy_keV': kept[0]['energy_keV'],
             'activity_MBq': activity,
             # Counting statistics ONLY - not the assay uncertainty.
-            'counting_sigma_MBq': activity / math.sqrt(total_net),
-            'net_counts': total_net,
+            'counting_sigma_MBq': (activity * sigma_net / net_source
+                                   if net_source > 0 else 0.0),
+            'net_counts': net_source,
+            'gross_counts': total_gross,
+            'background_counts': total_bg + bg_counts,
             'live_time_s': total_live,
             'windows_used': len(kept),
             'windows_dropped': dropped,
@@ -191,6 +284,212 @@ def group_by_radionuclide(line_results, radionuclide_of):
             'lines': sorted(r['isotope'] for r in results),
             'net_counts': sum(r['net_counts'] for r in results),
         }
+    return out
+
+
+def cs137_co60_ratio(nuclides):
+    """Cs-137 : Co-60 ratio for a mixed field, or None unless BOTH are detected.
+
+    Reports two ratios (both as Cs-137 / Co-60):
+      - activity_ratio: the physical isotopic ratio (calibration-corrected).
+      - count_ratio: raw net counts, a calibration-INDEPENDENT fingerprint -
+        useful while the calibration factors are provisional (pre-recalibration).
+
+    Co-60 is the intended PRIMARY reference and Cs-137 the SECONDARY: Co-60's
+    Compton continuum sits under the Cs-137 662 keV peak (raising its background
+    and MDA) but Cs-137 does not reciprocally interfere with the Co-60 peaks.
+    """
+    cs = nuclides.get('Cs-137')
+    co = nuclides.get('Co-60')
+    if not cs or not co:
+        return None
+    a_cs = float(cs.get('activity_MBq', 0.0) or 0.0)
+    a_co = float(co.get('activity_MBq', 0.0) or 0.0)
+    net_cs = float(cs.get('net_counts', 0.0) or 0.0)
+    net_co = float(co.get('net_counts', 0.0) or 0.0)
+    return {
+        'activity_ratio': (a_cs / a_co) if a_co > 0 else None,
+        'count_ratio': (net_cs / net_co) if net_co > 0 else None,
+        'cs137_MBq': a_cs,
+        'co60_MBq': a_co,
+    }
+
+
+def run_line_totals(activity_reports):
+    """Per-line RUN totals (all windows) for EVERY configured line, detected or
+    not: {label: {net, gross, bg, live, energy}}. Used to build a background
+    reference (which needs the undetected lines too)."""
+    out = {}
+    for report in activity_reports:
+        live = float(report.get('live_time_s', 0.0) or 0.0)
+        if live <= 0:
+            continue
+        for iso in report.get('isotopes', []):
+            name = iso.get('isotope', '')
+            if not name:
+                continue
+            t = out.setdefault(name, {'net': 0.0, 'gross': 0.0, 'bg': 0.0,
+                                      'live': 0.0, 'energy': 0.0})
+            t['net'] += float(iso.get('net_corrected', 0.0) or 0.0)
+            t['gross'] += float(iso.get('gross_counts', 0.0) or 0.0)
+            t['bg'] += float(iso.get('background_counts', 0.0) or 0.0)
+            t['live'] += live
+            t['energy'] = float(iso.get('energy_keV', 0.0) or 0.0)
+    return out
+
+
+def build_background_rates(activity_reports):
+    """Per-line background NET RATE (cps) + 1-sigma, from a no-source run, for
+    later subtraction. sigma is the Poisson net-area uncertainty per second:
+    sqrt(gross + sideband_bg) / live. Returns {label: {net_cps, net_cps_sigma}}."""
+    rates = {}
+    for name, t in run_line_totals(activity_reports).items():
+        live = t['live']
+        if live <= 0:
+            continue
+        sigma_counts = math.sqrt(max(0.0, t['gross'] + t['bg']))
+        rates[name] = {
+            'net_cps': t['net'] / live,
+            'net_cps_sigma': sigma_counts / live,
+            'live_time_s': live,
+        }
+    return rates
+
+
+def screening_xml_block(id_results, unknown_peaks, exclude_names=()):
+    """N42 <Nuclide> entries for SCREENING identifications + an unknown-peaks
+    remark. Pure function (unit-tested).
+
+    Screening = the isotope-ID layer's spectral library match: it says a
+    nuclide IS PRESENT but carries no activity (no calibration for it). Any
+    nuclide already reported by the assay layer (quantified or MDA) is
+    excluded so it is not listed twice. Returns (list_of_nuclide_xml, remark).
+    """
+    blocks = []
+    for r in id_results or []:
+        if not r.get('identified') or r.get('nuclide') in exclude_names:
+            continue
+        lines_txt = ", ".join(
+            "{:.0f} keV (SNR {:.0f})".format(m['energy_keV'], m['snr'])
+            for m in r.get('matched_lines', []))
+        shared = "".join(
+            " AMBIGUITY: {:.1f} keV peak also matches {}.".format(
+                s['peak_keV'], "/".join(s['also']))
+            for s in r.get('shared_peaks', []))
+        blocks.append(
+            '      <Nuclide>\n'
+            '        <NuclideIdentifiedIndicator>true</NuclideIdentifiedIndicator>\n'
+            '        <NuclideName>{name}</NuclideName>\n'
+            '        <Remark>SCREENING identification (spectral library match; '
+            'no calibration, so no activity is quoted): category {cat}, '
+            'score {score:.2f}, lines {lines}.{shared}</Remark>\n'
+            '      </Nuclide>'.format(
+                name=r['nuclide'], cat=r.get('category', ''),
+                score=r.get('score', 0.0), lines=lines_txt, shared=shared))
+    remark = ''
+    if unknown_peaks:
+        remark = ('    <Remark>Screening: unidentified peaks at {} - matching '
+                  'no library nuclide.</Remark>\n'.format(
+                      ", ".join("{:.1f} keV (SNR {:.0f})".format(
+                          p['energy_keV'], p['snr']) for p in unknown_peaks)))
+    return blocks, remark
+
+
+def load_background(path):
+    """Load a background reference written by build_background_rates/save.
+    Returns {label: {net_cps, net_cps_sigma}} or None if absent/unreadable."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return None
+    lines = data.get('lines') if isinstance(data, dict) else None
+    return lines or None
+
+
+def detected_line_labels(activity_reports):
+    """Line labels DETECTED over the run (run-total net exceeds the Currie
+    critical level). Delegates to aggregate_run_activity so the CSV filter, the
+    N42 activities and the MDA decision all share ONE run-level detection rule
+    rather than the activity node's per-window ``valid`` flag.
+    """
+    return set(aggregate_run_activity(activity_reports).keys())
+
+
+def detected_nuclides(activity_reports, radionuclide_of):
+    """Radionuclides detected in the run (>=1 valid window on ANY of their lines).
+
+    Used to filter the CSV at the NUCLIDE level: if Co-60 is seen on 1173 keV,
+    its 1332 keV line is kept too even when that line stayed below the per-window
+    validity threshold - the two Co-60 lines are a consistency pair and dropping
+    one hides that the weaker line is under threshold.
+    """
+    return set(radionuclide_of(l) for l in detected_line_labels(activity_reports))
+
+
+def currie_mda_bq(total_background_counts, efficiency_product, total_live_time_s):
+    """Currie detection limit L_D converted to activity (Bq).
+
+    L_D = 2.71 + 4.65*sqrt(B) NET counts (95% confidence, Currie 1968), then
+    A = L_D / (K * t_live) with K the efficiency product reported per line by the
+    activity node (A_Bq = net / (K * t_live)). Returns None when it cannot be
+    computed (no efficiency/geometry, or no live time).
+    """
+    try:
+        K = float(efficiency_product)
+        t = float(total_live_time_s)
+    except (TypeError, ValueError):
+        return None
+    if K <= 0.0 or t <= 0.0:
+        return None
+    B = max(0.0, float(total_background_counts or 0.0))
+    L_D = 2.71 + 4.65 * math.sqrt(B)
+    return L_D / (K * t)
+
+
+def non_detected_nuclide_mdas(activity_reports, detected, radionuclide_of):
+    """MDA (Bq) for each configured nuclide that was NOT detected in the run.
+
+    A nuclide is a non-detection only if NONE of its lines were detected. Its MDA
+    is bounded by its MOST SENSITIVE line (lowest MDA). Background and live time
+    are summed over the whole run: more counting time -> lower (better) MDA.
+    """
+    total_live = 0.0
+    bg = {}       # label -> summed background counts
+    K = {}        # label -> efficiency product (constant per run)
+    nuclide_of = {}
+    for report in activity_reports:
+        total_live += float(report.get('live_time_s', 0.0) or 0.0)
+        for iso in report.get('isotopes', []):
+            label = iso.get('isotope') or ''
+            if not label:
+                continue
+            bg[label] = bg.get(label, 0.0) + float(iso.get('background_counts', 0.0) or 0.0)
+            kp = float(iso.get('efficiency_product', 0.0) or 0.0)
+            if kp > 0.0:
+                K[label] = kp
+            nuclide_of[label] = radionuclide_of(label)
+
+    lines_by_nuclide = {}
+    for label, nuc in nuclide_of.items():
+        lines_by_nuclide.setdefault(nuc, []).append(label)
+
+    out = {}
+    for nuc, labels in lines_by_nuclide.items():
+        if any(l in detected for l in labels):
+            continue  # nuclide was detected on at least one line
+        candidates = []
+        for l in labels:
+            mda = currie_mda_bq(bg.get(l, 0.0), K.get(l, 0.0), total_live)
+            if mda is not None:
+                candidates.append((mda, l))
+        if not candidates:
+            continue
+        best_mda, best_line = min(candidates)
+        out[nuc] = {'mda_Bq': best_mda, 'line': best_line,
+                    'lines': sorted(labels), 'live_time_s': total_live}
     return out
 
 
@@ -234,6 +533,34 @@ class DataRecorderNode(object):
         self.assay_systematic_uncertainty_pct = rospy.get_param(
             "~assay_systematic_uncertainty_percent", 10.6)
 
+        # Apply detector dead-time correction (real/live) to the saved net areas
+        # and activities. Default ON: this is the physically correct behaviour.
+        # WARNING: the calibration_factor values in isotopes.yaml MUST be derived
+        # from dead-time-corrected data when this is on, or the correction is
+        # double-counted (see dead_time_correction_factor()). Set false only to
+        # reproduce legacy uncorrected numbers.
+        self.apply_dead_time_correction = rospy.get_param(
+            "~apply_dead_time_correction", True)
+
+        # Report configured-but-not-detected nuclides in the N42 as a
+        # non-detection with a Currie MDA ("Cs-137 not detected, < X MBq").
+        # A non-detection is evidence only if it carries a limit; without this the
+        # N42 simply omits absent nuclides. The CSV always omits absent lines
+        # regardless (a per-window zero-activity row is pure noise).
+        self.report_non_detected_mda = rospy.get_param(
+            "~report_non_detected_mda", True)
+
+        # Background subtraction. A no-source run is recorded once (set
+        # ~record_background true, then take a run) into background_file; every
+        # later run then subtracts those per-line net rates, removing ambient
+        # peaks (environmental Cs-137) and zero-background false positives.
+        self.background_file = rospy.get_param(
+            "~background_file", os.path.join(self.output_dir, "background.yaml"))
+        self.background_rates = load_background(self.background_file)
+        if self.background_rates:
+            rospy.loginfo("Data recorder: background subtraction ON (%d lines from %s)",
+                          len(self.background_rates), self.background_file)
+
         # Ensure output dir exists
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -262,6 +589,54 @@ class DataRecorderNode(object):
         # Latest valid detector run-info captured during the active recording.
         self._last_run_info = self._empty_run_info()
         self._run_info_lock = threading.Lock()
+        self._run_info_timer = None   # periodic run-info poll during recording
+
+        # Isotope-ID screening layer: identifies ANY library nuclide in the
+        # accumulated spectrum (SNM/IND/NORM), beyond the assay-configured
+        # Cs/Co. Periodic during recording (published on /identified_isotopes,
+        # consumed live by the heatmap for imaging bands) + a final full-
+        # resolution pass at stop that is embedded in the N42.
+        self.nuclide_library = None
+        lib_path = rospy.get_param("~nuclide_library", "")
+        if lib_path and isotope_id is not None:
+            try:
+                self.nuclide_library = isotope_id.load_nuclide_library(lib_path)
+                rospy.loginfo("Nuclide ID library: %d nuclides from %s",
+                              len(self.nuclide_library['nuclides']), lib_path)
+            except Exception as e:
+                rospy.logwarn("Could not load nuclide library %s: %s",
+                              lib_path, e)
+        elif lib_path:
+            rospy.logwarn("isotope_id module not importable - screening off")
+        self.isotope_id_period_s = float(
+            rospy.get_param("~isotope_id_period_s", 20.0))
+        # Rolling live-spectrum window for CONTINUOUS screening: /spectrum
+        # snapshots from the last ~isotope_id_window_s are summed and
+        # identified whether or not a recording is active, so the heatmap's
+        # imaging bands follow what is in front of the detector NOW (and a
+        # removed source drains out of the window). The end-of-run N42 pass
+        # still uses the run's own accumulated spectrum.
+        self.isotope_id_window_s = float(
+            rospy.get_param("~isotope_id_window_s", 180.0))
+        self._live_spectra = deque()
+        self._id_timer = None
+        self._last_screening = None
+        self.pub_identified = rospy.Publisher(
+            "/identified_isotopes", String, queue_size=2, latch=True)
+        # Per-LINE labels as data (JSON): every detected peak with its label
+        # ("Cs-137", "U-235/Ra-226", "?"), physics tags and a persistence
+        # flag, plus the energy-drift estimate. Single source of truth - the
+        # spectrum plotter draws THESE instead of re-identifying its own
+        # display buffer, so every view shows identical labels.
+        self.pub_identified_lines = rospy.Publisher(
+            "/identified_lines", String, queue_size=2, latch=True)
+        self._prev_line_energies = []
+        self.energy_drift_warn_kev = float(
+            rospy.get_param("~energy_drift_warn_kev", 1.0))
+        if self.nuclide_library is not None and self.isotope_id_period_s > 0:
+            self._id_timer = rospy.Timer(
+                rospy.Duration(max(10.0, self.isotope_id_period_s)),
+                self._poll_isotope_id)
 
         # Proxy service: user calls this instead of /detector/start_timed_acquisition
         self.record_srv = rospy.Service(
@@ -338,6 +713,15 @@ class DataRecorderNode(object):
                 resp.message = "Already recording. Wait for current acquisition to finish."
                 return resp
 
+        # Reset before every run: detector onboard DATA ('c' clear - the stale
+        # spectra behind the phantom peaks are data) + all node buffers, so a
+        # previous acquisition can never appear in this run's spectrum/assay.
+        # Deliberately NOT the full 'x' clear here: 'x' (data+windows) was
+        # observed to break get_run_info for the following acquisition
+        # (dead-time/count-rate saved as 0). The deep clear stays available
+        # via the manual /data_recorder/clear_all service.
+        self._clear_all_impl(full=False)
+
         # Forward to the real detector service
         try:
             rospy.wait_for_service("/detector/start_timed_acquisition", timeout=5.0)
@@ -383,22 +767,46 @@ class DataRecorderNode(object):
 
     def _handle_clear_all(self, req):
         """Clear the detector hardware AND every ROS-side accumulator buffer."""
-        from std_srvs.srv import Trigger, TriggerResponse
+        from std_srvs.srv import TriggerResponse
+        all_ok, message = self._clear_all_impl(full=True)
+        return TriggerResponse(success=all_ok, message=message)
+
+    def _clear_all_impl(self, full=False):
+        """Pipeline reset: detector onboard data + every node buffer.
+
+        full=False (run start): DATA-ONLY hardware clear ('c'). The stale
+        spectra that produced phantom peaks are DATA, and the full 'x'
+        (data+windows) clear was observed to break get_run_info for the
+        following acquisition (runs after the pre-run 'x' clear saved
+        dead-time/count-rate of 0 with run-info 'not_queried', 2026-08-26) -
+        "windows" clears more onboard state than the spectrum.
+        full=True (manual /data_recorder/clear_all): the deep 'x' clear,
+        with 'c' as fallback on older driver builds.
+        Returns (all_ok, message).
+        """
+        from std_srvs.srv import Trigger
         from phds_gegi_driver.srv import ClearData
 
         results = []
         all_ok = True
 
-        # 1) Hardware data buffer
-        try:
-            rospy.wait_for_service("/detector/clear_data", timeout=3.0)
-            r = rospy.ServiceProxy("/detector/clear_data", ClearData)()
-            ok = bool(r.success)
-            results.append("/detector/clear_data:{}".format("ok" if ok else "fail"))
-            all_ok = all_ok and ok
-        except Exception as e:
-            results.append("/detector/clear_data:err({})".format(e))
-            all_ok = False
+        # 1) Detector onboard data.
+        cleared = False
+        hw_services = (("/detector/clear_data_and_windows",
+                        "/detector/clear_data") if full
+                       else ("/detector/clear_data",))
+        for service in hw_services:
+            try:
+                rospy.wait_for_service(service, timeout=3.0)
+                r = rospy.ServiceProxy(service, ClearData)()
+                ok = bool(r.success)
+                results.append("{}:{}".format(service, "ok" if ok else "fail"))
+                cleared = ok
+                if ok:
+                    break
+            except Exception as e:
+                results.append("{}:err({})".format(service, e))
+        all_ok = all_ok and cleared
 
         # 2) ROS node buffers (heatmap event window, spectra, activity window)
         for name in self.node_clear_services:
@@ -414,12 +822,17 @@ class DataRecorderNode(object):
 
         message = "; ".join(results)
         rospy.loginfo("clear_all: %s", message)
-        return TriggerResponse(success=all_ok, message=message)
+        return all_ok, message
 
     def _start_recording(self, duration_minutes):
         start_dt = datetime.now()
         timestamp = start_dt.strftime("%Y%m%d_%H%M%S")
         bag_path = os.path.join(self.output_dir, "{}_compton_events.bag".format(timestamp))
+
+        # Align the activity node's counting window with this run BEFORE the
+        # recording flag goes up, so a stale (pre-run, idle-diluted) window can
+        # never be appended to this run's results.
+        self._clear_activity_node()
 
         with self._run_info_lock:
             self._last_run_info = self._empty_run_info()
@@ -450,18 +863,43 @@ class DataRecorderNode(object):
         self.timer.daemon = True
         self.timer.start()
 
+        # Poll detector run-info periodically DURING the run and keep the last
+        # valid frame. A single pre-stop query alone misses it for a timed
+        # acquisition: the detector auto-stops at the duration, so by the time we
+        # ask it is idle and returns zeros. Polling is safe now that get_run_info
+        # is served INLINE by the driver's monitor thread (it no longer consumes
+        # any event-stream bytes), so it does not degrade the recorded data.
+        self._run_info_timer = rospy.Timer(
+            rospy.Duration(max(5.0, self.run_info_poll_s)), self._poll_run_info)
+        # (Isotope-ID screening runs on its own permanent timer over the
+        # rolling live window - see __init__ - so it needs no start here.)
+        self._last_screening = None
+
     def _stop_recording(self):
         """Called when the timed acquisition ends. Save all files."""
         rospy.loginfo("Timed acquisition complete. Saving data files...")
 
-        # Single run-info query while the detector is (usually) still acquiring.
-        # We do this ONCE per run rather than polling: each query consumes and
-        # discards a slice of the shared event stream, so one query keeps the
-        # recorded spectrum/heatmap faithful. Cached for the activity CSV below.
+        # Stop the periodic run-info poll; the last valid frame it captured
+        # (mid-run, while the detector was definitely acquiring) is what we save.
+        if getattr(self, '_run_info_timer', None) is not None:
+            self._run_info_timer.shutdown()
+            self._run_info_timer = None
+        # (the isotope-ID timer is permanent - it keeps screening the rolling
+        # live window between recordings, so it is NOT shut down here)
+
+        # One more best-effort query (the detector is usually idle by now for a
+        # timed run, returning zeros). Only overwrite the polled value if this one
+        # is a genuine active frame (real_time > 0), so a post-stop idle reply
+        # never clobbers a good mid-run capture.
         pre_stop_info = self._query_run_info_once()
         if pre_stop_info['valid'] and pre_stop_info['real_time_sec'] > 0.0:
             with self._run_info_lock:
                 self._last_run_info = pre_stop_info
+
+        # Flush the activity node's final (not-yet-full) counting window NOW, while
+        # recording is still True so _on_activity appends it. Without this a long
+        # counting_window_s (one window per run) would drop the run's only window.
+        self._flush_activity_node()
 
         # Keep recording flag on briefly to capture any final heatmap/activity publishes
         # The heatmap node publishes every ~2s; wait one cycle to get final state.
@@ -490,15 +928,44 @@ class DataRecorderNode(object):
         # already flagged stopped, so this no longer inflates the run totals).
         detector_run_info = self._fetch_detector_run_info_post_stop()
 
+        # Dead-time correction factor for this run (one value, applied uniformly
+        # to net areas and activities in the CSV and the N42). The per-window
+        # activity node cannot supply live dead-time here because run-info polling
+        # during acquisition is disabled (single-socket contention), so the
+        # authoritative post-run figure is the one and only correction point.
+        dt_factor = 1.0
+        if self.apply_dead_time_correction:
+            dt_factor = dead_time_correction_factor(
+                detector_run_info.get('real_time_sec'),
+                detector_run_info.get('live_time_sec'),
+                detector_run_info.get('dead_time_percent'))
+        rospy.loginfo("  Dead-time correction factor: %.5f (%s)", dt_factor,
+                      "applied" if self.apply_dead_time_correction else "disabled")
+
         # Close bag file
         if bag:
             bag.close()
             rospy.loginfo("  Bag saved: %s_compton_events.bag", prefix)
 
+        # If this run is a BACKGROUND measurement, write its per-line net rates as
+        # the reference and do NOT subtract it from itself. Otherwise subtract the
+        # loaded background from this sample.
+        record_bg = bool(rospy.get_param("~record_background", False))
+        if record_bg:
+            self._write_background(activities, measurement_id)
+        bg_rates = None if record_bg else self.background_rates
+
+        # Final isotope-ID screening pass at FULL resolution over the RUN's
+        # accumulated spectrum (the periodic passes use the rolling live
+        # window, 4x rebinned). Result goes on /identified_isotopes and into
+        # the N42 <AnalysisResults> as screening identifications.
+        screening = self._run_isotope_id(rebin=1, source='run')
+
         # Save spectrum as N42, with the run's activity results embedded so the
         # N42 is a complete standards-compliant record (spectrum + activities).
         self._save_n42(prefix, spectrum, real_time_ms, live_time_ms,
-                       measurement_id, reference_datetime, activities)
+                       measurement_id, reference_datetime, activities, dt_factor,
+                       bg_rates, screening=screening)
 
         # Save heatmap raw points CSV (irregular, per-isotope scores)
         try:
@@ -522,7 +989,8 @@ class DataRecorderNode(object):
         try:
             self._save_activity_csv(prefix, activities, detector_run_info,
                                     real_time_ms, live_time_ms,
-                                    measurement_id, reference_datetime)
+                                    measurement_id, reference_datetime, dt_factor,
+                                    bg_rates)
         except Exception as e:
             rospy.logerr("Failed to save activity CSV: %s", e)
 
@@ -538,10 +1006,130 @@ class DataRecorderNode(object):
         rospy.loginfo("All data files saved with prefix: %s (measurement_id=%s)",
                       prefix, measurement_id)
 
+    def _flush_activity_node(self):
+        """Ask the activity node to publish its final partial counting window.
+
+        Best-effort: a failure just means the last window (usually a small tail)
+        is missing, not a crash. Called at end-of-run so a long counting window
+        (one per run) still records its data.
+        """
+        from std_srvs.srv import Trigger
+        try:
+            rospy.wait_for_service("/activity/flush", timeout=2.0)
+            rospy.ServiceProxy("/activity/flush", Trigger)()
+        except Exception as e:
+            rospy.logwarn("Could not flush activity node (%s)", e)
+
+    def _clear_activity_node(self):
+        """Reset the activity node's counting window at recording START.
+
+        The node's window free-runs, so without this the run's FIRST window
+        can straddle the start and carry PRE-RECORDING (idle) live time:
+        real bug 2026-08-26 - a 303 s run reported 378.5 s total live time,
+        deflating every activity ~20% (and the rate-based partial-window
+        filter sat exactly at its threshold and let the window through).
+        Clearing here aligns window boundaries with the run: total window
+        live time == recording live time. Symmetric partner of the flush at
+        stop. Best-effort, like the flush.
+        """
+        from std_srvs.srv import Trigger
+        try:
+            rospy.wait_for_service("/activity/clear", timeout=2.0)
+            rospy.ServiceProxy("/activity/clear", Trigger)()
+        except Exception as e:
+            rospy.logwarn("Could not clear activity node (%s)", e)
+
     @staticmethod
     def _empty_run_info():
         return {'valid': False, 'dead_time_percent': 0.0, 'real_time_sec': 0.0,
-                'live_time_sec': 0.0, 'message': 'not_queried'}
+                'live_time_sec': 0.0, 'count_rate_hz': 0.0, 'message': 'not_queried'}
+
+    def _run_isotope_id(self, rebin=1, source='live'):
+        """Run the screening layer and publish/cache the result.
+
+        source='live' (periodic): sum of the rolling ~isotope_id_window_s of
+        /spectrum snapshots - reflects what is in front of the detector NOW,
+        works with or without an active recording (a removed source drains
+        out of the window). source='run' (end of run): the recording's own
+        accumulated spectrum - faithful to the saved N42. rebin>1 sums
+        adjacent channels for the cheap periodic pass (the matched filter is
+        bin-width-aware). Returns (results, unknown) or None."""
+        if self.nuclide_library is None:
+            return None
+        with self.lock:
+            if source == 'run':
+                counts = self.accumulated_spectrum.astype(np.float64).copy()
+            else:
+                if not self._live_spectra:
+                    return None
+                counts = np.zeros(len(self.accumulated_spectrum),
+                                  dtype=np.float64)
+                for _, arr in self._live_spectra:
+                    counts += arr
+        if counts.sum() < 100:
+            return None
+        # Overflow guard: out-of-range energies pile into the TOP bin (known
+        # spectrum-node behaviour) and would fake a peak at the range end.
+        counts[-1] = 0.0
+        edges = np.asarray(self.bin_edges, dtype=np.float64)
+        if len(edges) < 2:
+            return None
+        bin_w = float(np.median(np.diff(edges)))
+        centers = edges + bin_w / 2.0
+        n = min(len(centers), len(counts))
+        counts, centers = counts[:n], centers[:n]
+        if rebin > 1:
+            m = (n // rebin) * rebin
+            counts = counts[:m].reshape(-1, rebin).sum(axis=1)
+            centers = centers[:m].reshape(-1, rebin).mean(axis=1)
+        try:
+            peaks, results, unknown = isotope_id.identify(
+                counts, centers, self.nuclide_library)
+        except Exception as e:
+            rospy.logwarn("Isotope-ID pass failed: %s", e)
+            return None
+        self._last_screening = (results, unknown)
+        identified = [r for r in results if r['identified']]
+        text = "|".join("{}:{:.2f}".format(r['nuclide'], r['score'])
+                        for r in identified) or "none"
+        self.pub_identified.publish(String(data=text))
+        if identified:
+            rospy.loginfo("Screening ID: %s", text)
+
+        # Per-line labels (single source of truth for every display) with
+        # flicker suppression and physics tags.
+        lines_out = isotope_id.label_peaks(peaks, results)
+        self._prev_line_energies = isotope_id.mark_persistent(
+            lines_out, self._prev_line_energies)
+        drift, n_drift = isotope_id.energy_drift_kev(results)
+        if n_drift >= 2 and abs(drift) > self.energy_drift_warn_kev:
+            rospy.logwarn_throttle(
+                300, "ENERGY-CALIBRATION DRIFT suspected: identified lines "
+                "sit %+.2f keV from their library energies (%d lines). "
+                "Labels and assay ROIs degrade with drift - check the "
+                "energy calibration." % (drift, n_drift))
+        self.pub_identified_lines.publish(String(data=json.dumps(
+            {'lines': lines_out,
+             'drift_keV': round(drift, 3),
+             'n_drift_lines': n_drift})))
+        return (results, unknown)
+
+    def _poll_isotope_id(self, _event):
+        """Periodic screening over the rolling live window (rospy.Timer
+        thread). Runs whether or not a recording is active - live viewing
+        gets identifications (and heatmap bands) too."""
+        self._run_isotope_id(rebin=4, source='live')
+
+    def _poll_run_info(self, _event):
+        """Periodic run-info capture DURING recording; keeps the last valid frame.
+        Runs in a rospy.Timer thread. Safe/lossless now that the driver serves
+        get_run_info inline (no event-stream bytes consumed)."""
+        if not self.recording:
+            return
+        info = self._query_run_info_once()
+        if info['valid'] and info['real_time_sec'] > 0.0:
+            with self._run_info_lock:
+                self._last_run_info = info
 
     def _query_run_info_once(self):
         """Single, non-blocking-ish query of /detector/get_run_info."""
@@ -556,6 +1144,11 @@ class DataRecorderNode(object):
                 info['dead_time_percent'] = float(resp.dead_time_percent)
                 info['real_time_sec'] = float(resp.real_time_sec)
                 info['live_time_sec'] = float(resp.live_time_sec)
+                # count_rate_hz = detector's TRUE input singles rate (the rate
+                # axis for the Exp C rate/dead-time characterisation). Captured
+                # here at the pre-stop boundary because live polling during
+                # streaming is unreliable (single-socket contention).
+                info['count_rate_hz'] = float(resp.count_rate_hz)
         except Exception as e:
             info['message'] = str(e)
         return info
@@ -570,9 +1163,11 @@ class DataRecorderNode(object):
         with self._run_info_lock:
             stored = dict(self._last_run_info)
         if stored.get('valid') and stored.get('real_time_sec', 0.0) > 0.0:
-            rospy.loginfo("  Detector run info: real=%.3fs live=%.3fs dead=%.3f%%",
+            rospy.loginfo("  Detector run info: real=%.3fs live=%.3fs dead=%.3f%% "
+                          "rate=%.1f Hz",
                           stored['real_time_sec'], stored['live_time_sec'],
-                          stored['dead_time_percent'])
+                          stored['dead_time_percent'],
+                          stored.get('count_rate_hz', 0.0))
             return stored
 
         rospy.logwarn("  Detector run info unavailable for this run")
@@ -594,10 +1189,25 @@ class DataRecorderNode(object):
                 pass
 
     def _on_spectrum(self, msg):
+        arr = np.array(msg.spectrum, dtype=np.uint32)
+        # IDLE GUARD (same as the activity node): the spectrum node stamps
+        # wall-clock real time on every snapshot even when the detector is not
+        # acquiring. A zero-count snapshot = idle detector; counting its time
+        # would inflate the run's real/live totals (e.g. the ~3 s stop grace).
+        if arr.sum() <= 0:
+            return
         with self.lock:
+            # Rolling live window for continuous isotope-ID screening -
+            # fed ALWAYS (recording or not). Same-length snapshots only.
+            now = rospy.get_time()
+            if len(arr) == len(self.accumulated_spectrum):
+                self._live_spectra.append((now, arr))
+            while (self._live_spectra and
+                   now - self._live_spectra[0][0] > self.isotope_id_window_s):
+                self._live_spectra.popleft()
+
             if not self.recording:
                 return
-            arr = np.array(msg.spectrum, dtype=np.uint32)
             n = min(len(arr), len(self.accumulated_spectrum))
             self.accumulated_spectrum[:n] += arr[:n]
             self.total_real_time_ms += msg.realTime_ms
@@ -691,7 +1301,8 @@ class DataRecorderNode(object):
             except (ValueError, TypeError):
                 pass
 
-    def _build_analysis_results_xml(self, activities, measurement_id):
+    def _build_analysis_results_xml(self, activities, measurement_id, dt_factor=1.0,
+                                    background_rates=None, screening=None):
         """Build the N42 <AnalysisResults> block: the run-level nuclide activities.
 
         N42.42 has native elements for nuclide activity results, so the spectrum
@@ -701,11 +1312,16 @@ class DataRecorderNode(object):
         Activities are aggregated over the run (total net counts / total live
         time, partial start-up windows excluded) and reported per RADIONUCLIDE:
         Co-60's two photopeaks quantify the same nuclide and are averaged.
+
+        screening (optional) = (id_results, unknown_peaks) from the isotope-ID
+        layer's end-of-run pass: identified library nuclides NOT covered by the
+        assay are appended as screening identifications (present, no activity),
+        and peaks matching no library nuclide are recorded in a remark.
         """
-        lines = aggregate_run_activity(activities)
-        if not lines:
-            return ""
-        nuclides = group_by_radionuclide(lines, self._controlled_radionuclide)
+        lines = aggregate_run_activity(activities, dt_factor=dt_factor,
+                                       background_rates=background_rates)
+        nuclides = (group_by_radionuclide(lines, self._controlled_radionuclide)
+                    if lines else {})
         u_sys = self.assay_systematic_uncertainty_pct
 
         nuclide_xml = []
@@ -730,6 +1346,45 @@ class DataRecorderNode(object):
                     lines=" ".join(res['lines']), uc=u_count, us=u_sys,
                     ue=u_expanded, spread=res['line_spread_percent']))
 
+        # Non-detections: a configured nuclide with no detected line is reported
+        # ONCE as a bounded non-detection (Currie MDA), which is real evidence -
+        # "screened down to < X and absent" - unlike a silent omission.
+        if self.report_non_detected_mda:
+            detected = set(lines.keys())   # run-level detected lines (from aggregate)
+            mdas = non_detected_nuclide_mdas(
+                activities, detected, self._controlled_radionuclide)
+            for name in sorted(mdas):
+                m = mdas[name]
+                mda_bq = m['mda_Bq'] * dt_factor
+                nuclide_xml.append(
+                    '      <Nuclide>\n'
+                    '        <NuclideIdentifiedIndicator>false</NuclideIdentifiedIndicator>\n'
+                    '        <NuclideName>{name}</NuclideName>\n'
+                    '        <NuclideActivityValue units="Bq">0</NuclideActivityValue>\n'
+                    '        <Remark>Not detected. Currie MDA (L_D, 95% confidence) '
+                    '= {mbq:.6g} MBq ({bq:.6g} Bq) over live time {live:.0f} s, '
+                    'bounded by line {line}. The MDA reflects the background under '
+                    'the ROI during this run.</Remark>\n'
+                    '      </Nuclide>'.format(
+                        name=name, mbq=mda_bq / 1.0e6, bq=mda_bq,
+                        live=m['live_time_s'], line=m['line']))
+
+        # Screening identifications from the isotope-ID layer: library nuclides
+        # present in the spectrum but outside the calibrated assay set (e.g.
+        # Eu-152, NORM lines). Assay-reported nuclides are excluded - the
+        # quantified entry (or MDA) above is the authoritative one for those.
+        scr_remark = ''
+        if screening:
+            id_results, unknown_pks = screening
+            assay_names = set(nuclides.keys())
+            if self.report_non_detected_mda:
+                assay_names.update(
+                    self._controlled_radionuclide(i.get('isotope', ''))
+                    for rep in activities for i in rep.get('isotopes', []))
+            scr_blocks, scr_remark = screening_xml_block(
+                id_results, unknown_pks, exclude_names=assay_names)
+            nuclide_xml.extend(scr_blocks)
+
         peak_xml = []
         for label in sorted(lines):
             res = lines[label]
@@ -747,25 +1402,57 @@ class DataRecorderNode(object):
                     label=label, used=res['windows_used'],
                     dropped=res['windows_dropped'], live=res['live_time_s']))
 
+        if not nuclide_xml and not peak_xml:
+            return ""
+
         ref = (' radMeasurementReferences="{}"'.format(measurement_id)
                if measurement_id else '')
+
+        # Mixed-field Cs-137 : Co-60 ratio (only when BOTH are detected).
+        ratio_remark = ''
+        ratio = cs137_co60_ratio(nuclides)
+        if ratio is not None:
+            parts = []
+            if ratio['activity_ratio'] is not None:
+                parts.append('activity ratio {:.3g}'.format(ratio['activity_ratio']))
+            if ratio['count_ratio'] is not None:
+                parts.append('raw net-count ratio {:.3g} (calibration-independent)'
+                             .format(ratio['count_ratio']))
+            ratio_remark = (
+                '    <Remark>Mixed field Cs-137 : Co-60 (as Cs-137 / Co-60): '
+                '{parts}. Co-60 is the PRIMARY quantitative reference (two '
+                'self-consistent lines, and unaffected by Cs-137); Cs-137 is '
+                'SECONDARY - its 662 keV peak sits on the Co-60 Compton continuum, '
+                'which raises its background and MDA.</Remark>\n'.format(
+                    parts=', '.join(parts)))
+
+        sections = []
+        if nuclide_xml:
+            sections.append('    <NuclideAnalysisResults>\n{}\n'
+                            '    </NuclideAnalysisResults>\n'.format(
+                                "\n".join(nuclide_xml)))
+        if peak_xml:
+            sections.append('    <PeakAnalysisResults>\n{}\n'
+                            '    </PeakAnalysisResults>\n'.format(
+                                "\n".join(peak_xml)))
         return (
             '  <AnalysisResults{ref}>\n'
             '    <Remark>Activities derived from the accumulated spectrum of this '
-            'measurement. The quoted NuclideActivityUncertaintyValue is the EXPANDED '
-            'uncertainty (k=2, 95%), combining per-run counting statistics with the '
-            'systematic assay uncertainty ({us:.1f}% 1sigma, dominated by source '
-            'position within the tray). It is NOT counting statistics alone.</Remark>\n'
-            '    <NuclideAnalysisResults>\n{nuclides}\n'
-            '    </NuclideAnalysisResults>\n'
-            '    <PeakAnalysisResults>\n{peaks}\n'
-            '    </PeakAnalysisResults>\n'
+            'measurement. Detected nuclides quote the EXPANDED uncertainty (k=2, '
+            '95%), combining per-run counting statistics with the systematic assay '
+            'uncertainty ({us:.1f}% 1sigma, dominated by source position within the '
+            'tray); it is NOT counting statistics alone. Non-detected configured '
+            'nuclides carry a Currie MDA.</Remark>\n'
+            '{ratio}'
+            '{screening}'
+            '{sections}'
             '  </AnalysisResults>\n'.format(
-                ref=ref, us=u_sys,
-                nuclides="\n".join(nuclide_xml), peaks="\n".join(peak_xml)))
+                ref=ref, us=u_sys, ratio=ratio_remark, screening=scr_remark,
+                sections="".join(sections)))
 
     def _save_n42(self, prefix, spectrum, real_time_ms, live_time_ms,
-                  measurement_id="", reference_datetime="", activities=None):
+                  measurement_id="", reference_datetime="", activities=None,
+                  dt_factor=1.0, background_rates=None, screening=None):
         """Save spectrum in ANSI N42.42 XML format.
 
         The measurement_id is stamped onto <RadMeasurement id=...> so the raw
@@ -831,7 +1518,8 @@ class DataRecorderNode(object):
             measurement_id=measurement_id,
             reference_datetime=reference_datetime,
             analysis_results=self._build_analysis_results_xml(
-                activities or [], measurement_id)
+                activities or [], measurement_id, dt_factor, background_rates,
+                screening=screening)
         )
 
         with open(filepath, 'w') as f:
@@ -1156,82 +1844,83 @@ class DataRecorderNode(object):
             return 'Co-60'
         return name
 
+    def _write_background(self, activities, measurement_id):
+        """Write this (no-source) run's per-line net rates as the background
+        reference used to subtract from later runs. Also updates the in-memory
+        rates so the very next run subtracts without a relaunch.
+        """
+        rates = build_background_rates(activities)
+        doc = {
+            'source_measurement_id': measurement_id,
+            'note': ('Per-line background NET rate (cps) for subtraction. '
+                     'Re-record on a no-source run with '
+                     'rosparam set /data_recorder/record_background true.'),
+            'lines': rates,
+        }
+        try:
+            with open(self.background_file, 'w') as f:
+                yaml.safe_dump(doc, f, default_flow_style=False)
+            self.background_rates = rates
+            rospy.loginfo("  Background reference written: %s (%d lines)",
+                          self.background_file, len(rates))
+        except Exception as e:
+            rospy.logerr("Failed to write background reference: %s", e)
+
     def _save_activity_csv(self, prefix, activities, detector_run_info,
                            run_real_time_ms=0, run_live_time_ms=0,
-                           measurement_id="", reference_datetime=""):
-        """Save activity measurement results as CSV.
+                           measurement_id="", reference_datetime="",
+                           dt_factor=1.0, background_rates=None):
+        """Save a RUN-LEVEL activity summary: ONE row per DETECTED line.
 
-        Columns are limited to what activity estimation needs:
-          - live_time_s: PER-window integration time used for the count rate.
-          - run_real_time_s / run_live_time_s: whole-run totals (scan duration).
-          - detector_run_*: authoritative hardware real/live/dead-time for the run.
-        The per-window real_time_s / dead_time_fraction / dead_time_status columns
-        were dropped: with live dead-time polling off they duplicated live_time_s
-        and read a constant zero; the real dead time is in detector_run_*.
+        Each row is the whole-run aggregate (total net / total live, ramp-up
+        windows excluded) - the SAME numbers embedded in the N42 - so a single
+        stable activity per line instead of a per-window series that varies window
+        to window. Undetected lines are NOT written here; they appear once in the
+        N42 as a Currie MDA. A blank run (nothing detected) therefore yields a
+        header-only CSV - read the N42 for its MDAs.
 
-        Provenance columns (measurement_id, measurement_basis, activity_unit,
-        reference_datetime, radionuclide) satisfy spec DB-GEGI-002/004 and
-        DB-ACT-001/002/003 so each processed peak row links to one parent
-        Measurement and never loses its unit/reference-date/basis.
+        Columns are run TOTALS: net_peak_area (raw), net_corrected (x dt_factor),
+        gross/background counts, live time, activity + counting sigma.
+        measurement_id links a stray CSV to its Measurement (spec DB-GEGI-002/004).
         """
-        import json
         filepath = os.path.join(self.output_dir, "{}_activity.csv".format(prefix))
 
-        run_real_time_s = run_real_time_ms / 1000.0
-        run_live_time_s = run_live_time_ms / 1000.0
+        lines = aggregate_run_activity(activities, dt_factor=dt_factor,
+                                       background_rates=background_rates)
+        drdt = detector_run_info.get('dead_time_percent', 0.0)
+        drcr = detector_run_info.get('count_rate_hz', 0.0)
+        ts = activities[0].get('timestamp', 0) if activities else 0
 
         with open(filepath, 'w') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "timestamp_s", "live_time_s",
-                "detector_run_info_valid", "detector_run_dead_time_percent",
-                "detector_run_real_time_s", "detector_run_live_time_s",
-                "isotope", "energy_keV", "gross_counts", "background_counts",
-                "net_peak_area", "net_corrected", "count_rate_cps",
-                "activity_MBq", "sigma_activity_MBq", "valid",
-                "run_real_time_s", "run_live_time_s",
-                "measurement_id", "radionuclide", "measurement_basis",
-                "activity_unit", "reference_datetime"
+                "timestamp_s", "measurement_id", "isotope", "valid",
+                "live_time_s", "gross_counts", "background_counts",
+                "net_peak_area", "net_corrected", "detector_run_dead_time_percent",
+                "detector_run_count_rate_hz", "activity_MBq", "sigma_activity_MBq"
             ])
 
-            for report in activities:
-                ts = report.get('timestamp', 0)
-                lt = report.get('live_time_s', 0)
-                drv = detector_run_info.get('valid', False)
-                drdt = detector_run_info.get('dead_time_percent', 0.0)
-                drrt = detector_run_info.get('real_time_sec', 0.0)
-                drlt = detector_run_info.get('live_time_sec', 0.0)
+            for label in sorted(lines):
+                r = lines[label]
+                net_raw = r['net_counts']          # raw net (dt not yet applied)
+                writer.writerow([
+                    "{:.3f}".format(ts),
+                    measurement_id,
+                    label,
+                    True,                          # only detected lines are written
+                    "{:.3f}".format(r['live_time_s']),
+                    "{:.0f}".format(r['gross_counts']),
+                    "{:.1f}".format(r['background_counts']),
+                    "{:.1f}".format(net_raw),
+                    "{:.1f}".format(net_raw * dt_factor),
+                    "{:.6f}".format(drdt),
+                    "{:.1f}".format(drcr),
+                    "{:.6f}".format(r['activity_MBq']),
+                    "{:.6f}".format(r['counting_sigma_MBq']),
+                ])
 
-                for iso in report.get('isotopes', []):
-                    iso_name = iso.get('isotope', '')
-                    writer.writerow([
-                        "{:.3f}".format(ts),
-                        "{:.3f}".format(lt),
-                        drv,
-                        "{:.6f}".format(drdt),
-                        "{:.3f}".format(drrt),
-                        "{:.3f}".format(drlt),
-                        iso_name,
-                        "{:.1f}".format(iso.get('energy_keV', 0)),
-                        "{:.0f}".format(iso.get('gross_counts', 0)),
-                        "{:.1f}".format(iso.get('background_counts', 0)),
-                        "{:.1f}".format(iso.get('net_peak_area', 0)),
-                        "{:.1f}".format(iso.get('net_corrected', 0)),
-                        "{:.4f}".format(iso.get('count_rate_cps', 0)),
-                        "{:.6f}".format(iso.get('activity_MBq', 0)),
-                        "{:.6f}".format(iso.get('sigma_activity_MBq', 0)),
-                        iso.get('valid', False),
-                        "{:.3f}".format(run_real_time_s),
-                        "{:.3f}".format(run_live_time_s),
-                        measurement_id,
-                        self._controlled_radionuclide(iso_name),
-                        "direct_measured",
-                        "MBq",
-                        reference_datetime
-                    ])
-
-        rospy.loginfo("  Activity CSV saved: %s (%d measurement windows)",
-                      filepath, len(activities))
+        rospy.loginfo("  Activity CSV saved: %s (%d detected line(s))",
+                      filepath, len(lines))
 
     def _save_manifest(self, prefix, measurement_id, reference_datetime,
                        duration_minutes, run_real_time_ms, run_live_time_ms,

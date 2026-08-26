@@ -1,9 +1,12 @@
 <?xml version="1.0"?>
 <launch>
     <!-- Activity computation node -->
-    <arg name="calibration_file" default="$(find phds_gegi_driver)/config/EnergyCal.csv"/>
+    <arg name="calibration_file" default="$(find phds_gegi_driver)/config/EnergyCal_15000_0p2keV.csv"/>
     <arg name="isotopes_config" default="$(find phds_gegi_driver)/config/isotopes.yaml"/>
-    <arg name="counting_window_s" default="60.0"/>
+    <!-- Counting window length. 300 s => a typical 5-min run is ONE window (one
+         activity row per run); the recorder flushes the final partial window at
+         stop so no tail is lost. Lower it (e.g. 60) for intra-run time resolution. -->
+    <arg name="counting_window_s" default="300.0"/>
     <arg name="spectrum_topic" default="/spectrum"/>
     <!-- Geometric solid angle fraction for tray geometry (0 = use config file value) -->
     <arg name="solid_angle_fraction" default="0.0"/>

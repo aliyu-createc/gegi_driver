@@ -164,7 +164,13 @@ class ActivityNode(object):
         # When > 0, the node uses first-principles (intrinsic efficiency + solid angle)
         # for geometry-independent activity measurement.
         self.source_distance_m = rospy.get_param("~source_distance_m", 0.0)
-        self.calibration_distance_m = rospy.get_param("~calibration_distance_m", 0.5)
+        # Default 0.0 (NOT 0.5) so an unset param falls through to the config's
+        # calibration_distance_m below. A non-zero default here would shadow the
+        # config value (line ~197 only overrides when <= 0) and derive the
+        # intrinsic efficiency at the wrong distance: e.g. anchoring at 0.5 m
+        # while activity is computed at 0.58 m inflates every result by
+        # Omega(0.5)/Omega(0.58) = 1.34x. Mirrors ~source_distance_m above.
+        self.calibration_distance_m = rospy.get_param("~calibration_distance_m", 0.0)
         # Detector crystal radius (loaded from config below; param overrides).
         self.crystal_radius_m = rospy.get_param("~crystal_radius_m", 0.0)
 
@@ -247,6 +253,10 @@ class ActivityNode(object):
 
         # Services
         self.clear_srv = rospy.Service("~clear", Trigger, self._handle_clear)
+        # Publish the final, not-yet-full counting window on demand (called by the
+        # data recorder at end-of-run) so no tail data is lost when the window is
+        # long - e.g. counting_window_s == run length -> one window per run.
+        self.flush_srv = rospy.Service("~flush", Trigger, self._handle_flush)
 
         # Subscribers
         self.sub = rospy.Subscriber(spectrum_topic, Spectrum,
@@ -348,8 +358,21 @@ class ActivityNode(object):
                           self.source_distance_m, self.solid_angle_fraction)
 
     def _on_spectrum(self, msg):
-        """Accumulate incoming spectrum snapshots into the counting window."""
+        """Accumulate incoming spectrum snapshots into the counting window.
+
+        IDLE GUARD: the spectrum node stamps WALL-CLOCK time on every snapshot
+        (realTime_ms = its publish period) whether or not the detector is
+        acquiring. A zero-count snapshot means the detector is not streaming
+        (even ambient background yields counts every interval on an HPGe), so
+        counting its time would dilute the window rate - live activities read
+        ~x0.6 low when the detector streamed for only ~60% of a window
+        (observed 2026-08-26). Idle snapshots are skipped entirely: the live
+        display freezes while the detector is idle instead of decaying, and
+        the window's live time counts only genuinely active periods.
+        """
         spectrum_arr = np.array(msg.spectrum, dtype=np.float64)
+        if spectrum_arr.sum() <= 0:
+            return
 
         with self.lock:
             n = min(len(spectrum_arr), len(self.accumulated_spectrum))
@@ -527,6 +550,18 @@ class ActivityNode(object):
         # transmission to recover the true activity (energy-dependent).
         transmission = self._shield_transmission(iso)
 
+        # Efficiency product K such that A_Bq = net_corrected / (K * live_time_s).
+        # Computed UNCONDITIONALLY (it depends only on geometry/efficiency/emission
+        # /shielding, never on counts), so a NON-detected line still carries the
+        # sensitivity a Currie MDA needs. Mirrors the activity paths below.
+        if iso.intrinsic_efficiency > 0 and self.solid_angle_fraction > 0:
+            _eps_abs = iso.intrinsic_efficiency * self.solid_angle_fraction
+        elif iso.efficiency > 0:
+            _eps_abs = iso.efficiency
+        else:
+            _eps_abs = 0.0
+        efficiency_product = _eps_abs * iso.emission_probability * transmission
+
         activity_Bq = 0.0
         epsilon_used = 0.0
         method_used = 'none'
@@ -571,6 +606,7 @@ class ActivityNode(object):
             'background_counts': background,
             'net_peak_area': net_peak_area,
             'net_corrected': net_corrected,
+            'efficiency_product': efficiency_product,
             'sigma_counts': sigma_corrected,
             'activity_Bq': activity_Bq,
             'sigma_activity_Bq': sigma_activity_Bq,
@@ -587,6 +623,21 @@ class ActivityNode(object):
             self.window_start_time = rospy.Time.now()
         rospy.loginfo("Activity node accumulator cleared")
         return TriggerResponse(success=True, message="Activity accumulator cleared")
+
+    def _handle_flush(self, req):
+        """Publish whatever is accumulated NOW as a final (partial) window.
+
+        Lets the data recorder capture the last, not-yet-full counting window at
+        end-of-run so no counts are lost when counting_window_s is long. No-op if
+        nothing has accumulated since the last publish.
+        """
+        with self.lock:
+            has_data = (self.accumulated_real_time_ms > 0
+                        or bool(np.any(self.accumulated_spectrum)))
+        if has_data:
+            self._compute_and_publish()
+            return TriggerResponse(success=True, message="Flushed final window")
+        return TriggerResponse(success=True, message="Nothing to flush")
 
 
 def main():
