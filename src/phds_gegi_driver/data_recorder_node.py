@@ -178,6 +178,7 @@ def aggregate_run_activity(activity_reports, drop_threshold=0.75, dt_factor=1.0,
     Returns {line_label: {...}} for DETECTED lines only; undetected configured
     lines are reported as MDAs by non_detected_nuclide_mdas().
     """
+    detection_floor_counts = 5.0
     per_line = {}
     for report in activity_reports:
         live = float(report.get('live_time_s', 0.0) or 0.0)
@@ -193,11 +194,26 @@ def aggregate_run_activity(activity_reports, drop_threshold=0.75, dt_factor=1.0,
                 'K': float(iso.get('efficiency_product', 0.0) or 0.0),
                 'act': float(iso.get('activity_MBq', 0.0) or 0.0),
                 'energy_keV': float(iso.get('energy_keV', 0.0) or 0.0),
+                # Position-aware correction provenance (activity node folds the
+                # factor into K, so the activity is already corrected; these
+                # only document it in the N42).
+                'pos_f': float(iso.get('position_factor', 1.0) or 1.0),
+                'slant': float(iso.get('slant_distance_m', 0.0) or 0.0),
             })
 
     results = {}
     for name, windows in per_line.items():
-        median_rate = _median([w['net'] / w['live'] for w in windows])
+        # Reference rate from SUBSTANTIVE windows only: a seconds-long flush
+        # fragment carries huge rate variance (14 counts in 1.25 s reads ~2x
+        # the true rate) and, with only two windows, can drag the median above
+        # the genuine full window's rate - which then gets dropped as
+        # "partial" while the fragment is kept (run 20260904_172346: activity
+        # reported from 14 counts). Fragments are still rate-filtered and
+        # summed normally; they just cannot steer the reference.
+        max_live = max(w['live'] for w in windows)
+        substantive = [w for w in windows if w['live'] >= 0.1 * max_live]
+        median_rate = _median([w['net'] / w['live']
+                               for w in (substantive or windows)])
         kept = [w for w in windows
                 if median_rate <= 0
                 or (w['net'] / w['live']) >= drop_threshold * median_rate]
@@ -223,7 +239,13 @@ def aggregate_run_activity(activity_reports, drop_threshold=0.75, dt_factor=1.0,
         # Run-level detection decision (Currie critical level). The subtracted
         # background and its measurement variance widen L_C, so a clean ROI (which
         # used to give L_C = 0) and ambient peaks no longer false-positive.
-        if net_source <= currie_critical_level(total_bg + bg_counts + bg_var):
+        # detection_floor_counts guards the residual B~0 pathology: with a truly
+        # empty ROI L_C -> 0 and a couple of stray counts in one short partial
+        # window "detect" (seen 2026-09-03: Co60_1173 0.097+-0.103 MBq from a
+        # 1.5 s window in a Cs-only run). A handful-of-counts floor is orders
+        # below any genuine assay signal.
+        if net_source <= max(currie_critical_level(total_bg + bg_counts + bg_var),
+                             detection_floor_counts):
             continue
         # Activity scale: prefer the reported efficiency product K (activity =
         # net_source/(K*total_live)); fall back to the window activity/net ratio for
@@ -240,6 +262,9 @@ def aggregate_run_activity(activity_reports, drop_threshold=0.75, dt_factor=1.0,
         # Net-area sigma: Poisson on the raw counts (gross + sideband bg =
         # net + 2*bg) plus the background-subtraction variance.
         sigma_net = math.sqrt(total_net + 2.0 * total_bg + bg_var)
+        # Position-corrected windows (factor meaningfully < 1) -> document the
+        # median factor/slant distance in the N42. Uncorrected runs report 1.0.
+        pos_windows = [w for w in kept if w.get('pos_f', 1.0) < 0.999]
         results[name] = {
             'isotope': name,
             'energy_keV': kept[0]['energy_keV'],
@@ -253,6 +278,11 @@ def aggregate_run_activity(activity_reports, drop_threshold=0.75, dt_factor=1.0,
             'live_time_s': total_live,
             'windows_used': len(kept),
             'windows_dropped': dropped,
+            'position_corrected': bool(pos_windows),
+            'position_factor': (_median([w['pos_f'] for w in pos_windows])
+                                if pos_windows else 1.0),
+            'slant_distance_m': (_median([w['slant'] for w in pos_windows])
+                                 if pos_windows else 0.0),
         }
     return results
 
@@ -504,9 +534,13 @@ class DataRecorderNode(object):
         self.run_info_settle_s = rospy.get_param("~run_info_settle_s", 15.0)
         # How often to poll detector run-info WHILE recording, so the true
         # dead-time is captured during acquisition (a post-stop query fails once
-        # the detector has stopped/reset). Each poll briefly shares the detector
-        # socket and drops a few events, so keep this coarse.
-        self.run_info_poll_s = rospy.get_param("~run_info_poll_s", 30.0)
+        # the detector has stopped/reset). Polls are LOSSLESS since the inline
+        # run-info fix (the 'i' prompt is one byte and the reply is decoded by
+        # the driver's monitor thread), so poll densely: some runs lose every
+        # reply to event-stream interleaving (dt saved as 0, ~1 run in 6
+        # observed 2026-09-03/04) and more attempts are the only mitigation
+        # short of a separate command socket in the C++ driver.
+        self.run_info_poll_s = rospy.get_param("~run_info_poll_s", 15.0)
         # Prefix for the durable measurement identifier written into every asset
         # so the database can link the N42, activity peak rows and heatmaps of a
         # run back to one parent Measurement (spec DB-GEGI-002 / DB-GEGI-004).
@@ -526,12 +560,17 @@ class DataRecorderNode(object):
         #
         # It is a parameter, not a constant, because the budget is rig-specific.
         #
-        # Default 10.6% = RSS of: position 10.2 (Exp E), repeatability 2.1 (Exp D),
-        # certificate 1.5 (Co-60 BH-4103: 3% expanded at k=2 -> 1.5% standard),
-        # efficiency transfer 1.1 (Exp B), shielding 1.0 (Exp F), dead-time 0.6
-        # (Exp C), Co-60 coincidence summing 0.05. -> expanded U(k=2) ~= 21.3%.
+        # Default 3.2% = RSS of: position 1.0 (position-aware correction ON -
+        # validated 2026-09-03, 5-position Exp E repeat: centre + 4 corners all
+        # within +-1% of cert, RSD 0.65%; 1.0 is the conservative allowance),
+        # repeatability 2.1 (Exp D), certificate 1.5 (Co-60 BH-4103: 3%
+        # expanded at k=2 -> 1.5% standard), efficiency transfer 1.1 (Exp B),
+        # shielding 1.0 (Exp F), dead-time 0.6 (Exp C), Co-60 coincidence
+        # summing 0.05. -> expanded U(k=2) ~= 6.4% (7.1% with 1.5% counting).
+        # If the pipeline runs with position_correction DISABLED, set this back
+        # to ~10.6 (position term 10.2, uncorrected Exp E) -> U(k=2) ~= 21%.
         self.assay_systematic_uncertainty_pct = rospy.get_param(
-            "~assay_systematic_uncertainty_percent", 10.6)
+            "~assay_systematic_uncertainty_percent", 3.2)
 
         # Apply detector dead-time correction (real/live) to the saved net areas
         # and activities. Default ON: this is the physically correct behaviour.
@@ -590,6 +629,9 @@ class DataRecorderNode(object):
         self._last_run_info = self._empty_run_info()
         self._run_info_lock = threading.Lock()
         self._run_info_timer = None   # periodic run-info poll during recording
+        # Most recent VALID run-info of the SESSION (any run) - dead-time
+        # fallback for runs that lose every reply (see the post-stop fetch).
+        self._session_prior_run_info = None
 
         # Isotope-ID screening layer: identifies ANY library nuclide in the
         # accumulated spectrum (SNM/IND/NORM), beyond the assay-configured
@@ -713,14 +755,20 @@ class DataRecorderNode(object):
                 resp.message = "Already recording. Wait for current acquisition to finish."
                 return resp
 
-        # Reset before every run: detector onboard DATA ('c' clear - the stale
-        # spectra behind the phantom peaks are data) + all node buffers, so a
-        # previous acquisition can never appear in this run's spectrum/assay.
-        # Deliberately NOT the full 'x' clear here: 'x' (data+windows) was
-        # observed to break get_run_info for the following acquisition
-        # (dead-time/count-rate saved as 0). The deep clear stays available
-        # via the manual /data_recorder/clear_all service.
-        self._clear_all_impl(full=False)
+        # Reset before every run: FULL detector onboard clear ('x', data +
+        # windows) + all node buffers. The data-only 'c' clear used here from
+        # 2026-08-26 to 2026-09-03 was PROVEN INSUFFICIENT on 2026-09-03: the
+        # GeGI re-streams retained spectral content that survives 'c' (~5% of
+        # the previous run's rates appeared as e.g. a persistent 2.4 cps
+        # Cs-137 line in Co-only runs; a GeGI-software full clear removed it,
+        # and the next run captured run-info fine). The August 'x'-breaks-
+        # run-info issue is covered by the 30 s run-info polling + retry in
+        # _query_run_info_once; a short settle after 'x' gives the detector
+        # time to finish the deep clear before acquisition starts. If a run
+        # ever saves 0 dead-time again, check run-info first before blaming
+        # this clear.
+        self._clear_all_impl(full=True)
+        rospy.sleep(2.0)
 
         # Forward to the real detector service
         try:
@@ -774,14 +822,19 @@ class DataRecorderNode(object):
     def _clear_all_impl(self, full=False):
         """Pipeline reset: detector onboard data + every node buffer.
 
-        full=False (run start): DATA-ONLY hardware clear ('c'). The stale
-        spectra that produced phantom peaks are DATA, and the full 'x'
-        (data+windows) clear was observed to break get_run_info for the
-        following acquisition (runs after the pre-run 'x' clear saved
-        dead-time/count-rate of 0 with run-info 'not_queried', 2026-08-26) -
-        "windows" clears more onboard state than the spectrum.
-        full=True (manual /data_recorder/clear_all): the deep 'x' clear,
-        with 'c' as fallback on older driver builds.
+        full=True (run start AND manual /data_recorder/clear_all): the deep
+        'x' (data+windows) clear, with 'c' as fallback on older driver
+        builds. REQUIRED at run start since 2026-09-03: the GeGI re-streams
+        retained spectral content that survives the data-only 'c' clear
+        (~5% of the previous run's rates - the source of both the August
+        phantom peaks, which the operator's manual full clears were silently
+        suppressing, and the September "Cs shine" that wasn't shine; run
+        20260903_214229 after a full clear was clean AND captured run-info).
+        The 2026-08-26 observation that a pre-run 'x' broke get_run_info is
+        covered by the run-info polling + retry; run start also settles 2 s
+        after the clear.
+        full=False: data-only 'c' clear (kept for callers that must not
+        touch onboard windows state).
         Returns (all_ok, message).
         """
         from std_srvs.srv import Trigger
@@ -1131,26 +1184,37 @@ class DataRecorderNode(object):
             with self._run_info_lock:
                 self._last_run_info = info
 
-    def _query_run_info_once(self):
-        """Single, non-blocking-ish query of /detector/get_run_info."""
+    def _query_run_info_once(self, attempts=3, retry_gap_s=0.7):
+        """Query /detector/get_run_info, retrying a couple of times.
+
+        The driver serves run-info inline: it prompts the detector ('i') and
+        waits up to ~1.5 s for the reply frame to be decoded by its monitor
+        thread. Under event load the decode can land just AFTER that window -
+        the service call fails but the frame IS cached driver-side, so an
+        immediate retry returns it. Observed 2026-09-03 (run 153132): every
+        30 s poll of a 5-min run failed ('not_queried' manifest, 0 dead-time
+        CSV) while the driver console printed valid inline frames.
+        """
         info = self._empty_run_info()
-        try:
-            rospy.wait_for_service('/detector/get_run_info', timeout=2.0)
-            proxy = rospy.ServiceProxy('/detector/get_run_info', GetRunInfo)
-            resp = proxy()
-            info['message'] = resp.message
-            if resp.success:
-                info['valid'] = True
-                info['dead_time_percent'] = float(resp.dead_time_percent)
-                info['real_time_sec'] = float(resp.real_time_sec)
-                info['live_time_sec'] = float(resp.live_time_sec)
-                # count_rate_hz = detector's TRUE input singles rate (the rate
-                # axis for the Exp C rate/dead-time characterisation). Captured
-                # here at the pre-stop boundary because live polling during
-                # streaming is unreliable (single-socket contention).
-                info['count_rate_hz'] = float(resp.count_rate_hz)
-        except Exception as e:
-            info['message'] = str(e)
+        for attempt in range(max(1, int(attempts))):
+            if attempt:
+                rospy.sleep(retry_gap_s)
+            try:
+                rospy.wait_for_service('/detector/get_run_info', timeout=2.0)
+                proxy = rospy.ServiceProxy('/detector/get_run_info', GetRunInfo)
+                resp = proxy()
+                info['message'] = resp.message
+                if resp.success:
+                    info['valid'] = True
+                    info['dead_time_percent'] = float(resp.dead_time_percent)
+                    info['real_time_sec'] = float(resp.real_time_sec)
+                    info['live_time_sec'] = float(resp.live_time_sec)
+                    # count_rate_hz = detector's TRUE input singles rate (the
+                    # rate axis for the Exp C rate/dead-time characterisation).
+                    info['count_rate_hz'] = float(resp.count_rate_hz)
+                    return info
+            except Exception as e:
+                info['message'] = str(e)
         return info
 
     def _fetch_detector_run_info_post_stop(self):
@@ -1168,7 +1232,32 @@ class DataRecorderNode(object):
                           stored['real_time_sec'], stored['live_time_sec'],
                           stored['dead_time_percent'],
                           stored.get('count_rate_hz', 0.0))
+            # Remember across runs: the fallback below borrows this dead time
+            # for a later run whose every run-info reply is lost.
+            self._session_prior_run_info = dict(stored)
             return stored
+
+        # FALLBACK (2026-09-04): some runs lose EVERY run-info reply to
+        # event-stream interleaving (~1 in 6 observed; the complete fix needs
+        # a dedicated command channel - PHDS question). Saving dt=0 silently
+        # under-corrects the assay by the true dead time (0.6-2.6%), so borrow
+        # the most recent VALID dead time from THIS session, clearly flagged.
+        # Dead time is composition-stable session to session (Co ~2.5%,
+        # Cs ~0.7%, mixed ~1.3% measured 2026-09-03/04), so the estimate is
+        # good to ~+-0.5% - far better than no correction. count_rate/real/
+        # live stay 0 (they are per-run quantities and unknown), which also
+        # makes estimated runs recognisable in the CSV (dt > 0, rate = 0).
+        prior = getattr(self, '_session_prior_run_info', None)
+        if prior and prior.get('dead_time_percent', 0.0) > 0.0:
+            est = self._empty_run_info()
+            est['valid'] = True
+            est['dead_time_percent'] = float(prior['dead_time_percent'])
+            est['message'] = ('dead_time_ESTIMATED_from_prior_run (run-info '
+                             'unavailable this run; count rate unknown)')
+            rospy.logwarn("  Detector run info unavailable - using ESTIMATED "
+                          "dead time %.3f%% from the previous valid run",
+                          est['dead_time_percent'])
+            return est
 
         rospy.logwarn("  Detector run info unavailable for this run")
         return self._empty_run_info()
@@ -1390,17 +1479,24 @@ class DataRecorderNode(object):
             res = lines[label]
             cps = (res['net_counts'] / res['live_time_s']
                    if res['live_time_s'] > 0 else 0.0)
+            pos_note = ''
+            if res.get('position_corrected'):
+                pos_note = (' Position-corrected from imaged hotspot: slant '
+                            'distance {slant:.3f} m, efficiency factor '
+                            '{pf:.4f}.'.format(slant=res['slant_distance_m'],
+                                               pf=res['position_factor']))
             peak_xml.append(
                 '      <Peak>\n'
                 '        <PeakEnergyValue units="keV">{e:.2f}</PeakEnergyValue>\n'
                 '        <PeakNetAreaValue>{net:.1f}</PeakNetAreaValue>\n'
                 '        <PeakNetCountRateValue units="cps">{cps:.4f}</PeakNetCountRateValue>\n'
                 '        <Remark>{label}: {used} window(s) used, {dropped} partial '
-                'window(s) excluded; live time {live:.1f} s.</Remark>\n'
+                'window(s) excluded; live time {live:.1f} s.{pos}</Remark>\n'
                 '      </Peak>'.format(
                     e=res['energy_keV'], net=res['net_counts'], cps=cps,
                     label=label, used=res['windows_used'],
-                    dropped=res['windows_dropped'], live=res['live_time_s']))
+                    dropped=res['windows_dropped'], live=res['live_time_s'],
+                    pos=pos_note))
 
         if not nuclide_xml and not peak_xml:
             return ""

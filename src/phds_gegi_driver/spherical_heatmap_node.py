@@ -105,6 +105,19 @@ def identified_bands(names, library_nuclides, window_kev=30.0, defaults=None):
     in the library: imaging wants EVENTS, so a multi-line nuclide can image a
     wide band over a line CLUSTER (e.g. Eu-152's 964+1086+1112 keV, ~38% of
     decays) instead of its single representative line.
+
+    NOTE - do NOT narrow the Co-60 band in mixed Cs+Co fields (tried and
+    REVERTED 2026-09-03, Exp G): a 1332-photopeak-only band (1325-1343) was
+    deployed on the theory that Cs+Cs chance-coincidence events contaminate
+    the wide band and drag the Co hotspot toward Cs. Measurement killed the
+    theory: a Cs-only run at 1316 Hz shows ~zero counts at the 1324 keV sum
+    energy (no randoms at all - the event-builder coincidence window is too
+    short), while the narrow band cut Co imaging statistics ~10x (450 -> 40
+    events) and made the imaged offset WORSE (0.165-0.192 m vs 0.196 wide,
+    true 0.25): few-event backprojection biases toward the detector axis.
+    The residual mixed-field Co position bias (~ -6% activity) is a
+    low-statistics/reconstruction effect, not band contamination; for
+    activity RATIOS place the sources co-located so geometry cancels.
     """
     bands = dict(defaults if defaults is not None else ISOTOPE_PEAKS)
     for name in names or []:

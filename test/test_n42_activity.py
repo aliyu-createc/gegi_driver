@@ -143,6 +143,32 @@ class TestAggregation(unittest.TestCase):
     def test_no_valid_data_yields_nothing(self):
         self.assertEqual(dr.aggregate_run_activity([]), {})
 
+    def test_few_stray_counts_in_empty_roi_do_not_detect(self):
+        """B~0 pathology guard: with an empty ROI, Currie L_C -> 0 and a couple
+        of stray counts in one short partial window used to 'detect' (observed
+        2026-09-03: Co60_1173 0.097+-0.103 MBq from a 1.5 s window in a
+        Cs-only run). The absolute floor kills it."""
+        reports = [window(1.5, [('Co60_1173', 3.0, 0.1, 1173.2)])]
+        self.assertNotIn('Co60_1173', dr.aggregate_run_activity(reports))
+
+    def test_floor_does_not_suppress_modest_real_signals(self):
+        reports = [window(300.0, [('Cs137', 30.0, 2e-6, 661.7)])]
+        self.assertIn('Cs137', dr.aggregate_run_activity(reports))
+
+    def test_fluke_high_flush_fragment_cannot_drop_the_main_window(self):
+        """Regression (run 20260904_172346): a 1.25 s end-of-run flush with a
+        statistically inflated rate dragged the two-window median up, the
+        genuine 300 s window was dropped as 'partial', and the activity was
+        reported from 14 counts. Fragments must not steer the reference."""
+        reports = [
+            window(300.0, [('Co60_1173', 1700.0, 1.10, 1173.2)]),  # 5.67 cps
+            window(1.25, [('Co60_1173', 14.0, 2.10, 1173.2)]),     # 11.2 cps
+        ]
+        res = dr.aggregate_run_activity(reports)['Co60_1173']
+        self.assertEqual(res['windows_dropped'], 0)
+        self.assertAlmostEqual(res['net_counts'], 1714.0, delta=1e-9)
+        self.assertGreater(res['live_time_s'], 300.0)
+
 
 class TestRadionuclideGrouping(unittest.TestCase):
     """Co-60's two photopeaks quantify ONE nuclide and must be combined."""
@@ -444,8 +470,15 @@ class TestUncertaintySemantics(unittest.TestCase):
         return 2.0 * math.sqrt(u_counting_pct ** 2 + u_systematic_pct ** 2)
 
     def test_well_counted_run_reports_about_the_budget(self):
-        # counting 1.5%, systematic 10.7% -> ~21.6% expanded (the DJR headline)
+        # counting 1.5%, systematic 10.7% -> ~21.6% expanded (the pre-
+        # position-correction DJR headline)
         self.assertAlmostEqual(self._expanded(1.5, 10.7), 21.6, delta=0.2)
+
+    def test_position_corrected_budget_headline(self):
+        # With the position-aware correction ON (validated 2026-09-03: Exp E
+        # centre + 4 corners within +-1%, RSD 0.65%) the systematic budget is
+        # 3.2% -> a well-counted run reports ~7.1% expanded (k=2).
+        self.assertAlmostEqual(self._expanded(1.5, 3.2), 7.07, delta=0.05)
 
     def test_marginal_run_correctly_widens(self):
         # near the MDA counting statistics dominate and U must blow up

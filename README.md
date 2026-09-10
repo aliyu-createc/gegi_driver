@@ -9,6 +9,8 @@ This project provides:
 - ROS services for detector control (start, stop, clear, run info, detector info, timed acquisitions, bias toggle).
 - A spectrum accumulator node with energy calibration.
 - A spherical heatmap node for directional source localization and isotope identification.
+- An activity node that computes net peak areas and Bq per isotope.
+- A data recorder that saves `.bag`, `.n42`, and `.csv` at the end of a timed acquisition.
 - Utility scripts for topic monitoring and live plotting.
 
 ## Main ROS Interfaces
@@ -23,6 +25,7 @@ This project provides:
 **Spectrum node** (`spectrum_node.py`):
 
 - `/spectrum` (`radiation_detector_msgs/Spectrum`): Accumulated energy histogram, published at configurable rate.
+  - Publishes **per-interval deltas**, not a running total. The data recorder integrates them.
 
 **Spherical heatmap node** (`spherical_heatmap_node.py`):
 
@@ -30,6 +33,10 @@ This project provides:
 - `/source_direction` (`geometry_msgs/PoseStamped`): Peak source direction estimate.
 - `/source_directions` (`geometry_msgs/PoseArray`): All detected direction peaks.
 - `/source_isotopes` (`std_msgs/String`): Isotope identification result.
+
+**Activity node** (`activity_node.py`):
+
+- Computes net peak area and activity (Bq) per isotope from the accumulated spectrum, using the calibration and geometry in `config/isotopes.yaml`.
 
 ### Exposed Services
 
@@ -48,109 +55,114 @@ All detector control services are under `/detector/*`:
 | File | Description |
 |------|-------------|
 | `gegi_driver.launch` | Driver node only (TCP connection to detector) |
-| `gegi_full_pipeline.launch` | Driver + spectrum + spherical heatmap + rosbridge websocket |
+| `gegi_full_pipeline.launch` | Driver + spectrum + spherical heatmap + activity + data recorder + rosbridge websocket |
 | `spectrum.launch` | Standalone spectrum accumulator node |
 | `spherical_heatmap.launch` | Standalone spherical heatmap node |
+| `activity.launch` | Standalone activity computation node |
+| `data_recorder.launch` | Standalone data recorder node |
 
 ## Prerequisites
 
 ### Hardware / Detector
 
 - Detector powered and cooled (according to PHDS operating guidance).
-- Detector network reachable from the host running Docker.
+- Detector network reachable from the host running the driver (default `192.168.50.109:27015`).
 - Detector acquisition application on the tablet in the correct recording state.
+- The detector accepts **one TCP connection**, owned by the C++ driver node. Do not open a second connection.
 
 ### Software
 
-- Docker Desktop (Windows/Linux/macOS).
-- For non-Docker workflows: ROS Melodic-compatible catkin environment.
+- **ROS Melodic** (Python 2.7) on **Ubuntu 18.04** — Melodic is end-of-life and will not install on newer Ubuntu.
+- On Windows this runs under **WSL2** (the current development setup) or Docker; the driver cannot run natively on Windows.
+- Only the live plotting tools run natively on Windows — they connect over the rosbridge websocket on port 9090.
 
-## Quick Start (Docker)
+## Development Workflow (WSL2 — current setup)
 
-### 1) Build the image
+The driver is developed and run natively inside a WSL2 distro named **`ros-melodic`**
+(Ubuntu 18.04 + ROS Melodic). This replaced the old Docker "rebuild an image per
+change" loop.
 
-Run from the repository root:
+**The Windows repository is the single source of truth.** The catkin workspace at
+`~/gegi_ws` inside the distro is a working copy, kept in sync by helper scripts.
 
-```powershell
-docker build -t phds_gegi_driver -f .\docker\dockerfiles\phds_gegi_amd64 .
-```
+> The `sync.sh` / `build.sh` / `run.sh` helper scripts live **outside the repo**, in
+> `~/gegi_ws/` inside the distro (staged copies at `C:\wsl\*.sh`). They are a WSL
+> convenience and are intentionally not versioned here — a fresh clone uses standard
+> catkin instead (see [docs/PORTING.md](docs/PORTING.md)).
 
-What it does:
+### What each helper does
 
-- Builds the ROS workspace and driver into an image named `phds_gegi_driver`.
-- Uses the amd64 Dockerfile in `docker/dockerfiles/phds_gegi_amd64`.
+| Script | Action | When to run |
+|--------|--------|-------------|
+| `sync.sh` | Re-copy source from the Windows repo, strip CRLF line endings, install the Python nodes into `devel/lib`. | After **Python** node changes |
+| `build.sh` | `sync.sh` + `catkin_make`. | After **C++** changes |
+| `run.sh` | `roslaunch phds_gegi_driver gegi_full_pipeline.launch`. | To start the pipeline |
 
-Notes:
+Because `catkin_install_python` is install-only, the Python nodes are copied into
+`~/gegi_ws/devel/lib/phds_gegi_driver/` by `sync.sh` (this mirrors the Dockerfile).
 
-- The first build needs internet access because Docker must pull the base ROS image and install apt packages.
-- After the image has been built once, source-only rebuilds can usually run offline as long as Docker cache and the base image are still present locally.
-- If you change the Dockerfile itself or clear the Docker cache, the build may need internet again.
+### Typical loop
 
-### 2) Run the full pipeline container
-
-```powershell
-docker run --rm -d -p 9090:9090 --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_full_pipeline.launch"
-```
-
-What it does:
-
-- Starts a container named `gegi_live` in detached mode.
-- Publishes the rosbridge websocket on port 9090 so Windows-side plotting tools can connect.
-- Sources ROS + workspace setup files.
-- Launches driver + spectrum + spherical heatmap + rosbridge via `gegi_full_pipeline.launch`.
-
-> **Note:** Do not use `--network host` on Docker Desktop for Windows — it does not actually expose container ports to the host. Use `-p` port mappings instead.
-
-If you only want the detector driver (without spectrum/heatmap), use:
+Open the distro:
 
 ```powershell
-docker run --rm -d -p 9090:9090 --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_driver.launch"
+wsl -d ros-melodic
 ```
+
+Then inside the distro:
+
+```bash
+# after editing Python nodes on the Windows side:
+cd ~/gegi_ws && ./sync.sh && ./run.sh
+
+# after editing C++ (driver / socket_comms):
+cd ~/gegi_ws && ./build.sh && ./run.sh
+```
+
+> **Cross-shell quoting caveat:** running `wsl bash -lc "..."` from a Windows shell
+> eats `$variables`. Run script *files* inside the distro (or via
+> `tr -d '\r' < /mnt/c/wsl/x.sh > /tmp/x.sh && bash /tmp/x.sh`) rather than passing
+> inline command strings with shell variables.
+
+### Landing recorded data in the Windows repo
+
+Override `output_dir` to a `/mnt/c/...` path so the data recorder writes `.bag` /
+`.n42` / `.csv` straight into a Windows folder:
+
+```bash
+roslaunch phds_gegi_driver gegi_full_pipeline.launch \
+    output_dir:=/mnt/c/Users/<you>/gegi_data
+```
+
+(`data/` is gitignored — measurement data is archived separately, not committed.)
 
 ## Monitoring Topics
 
-### watch_gegi_topics.ps1
+From inside the `ros-melodic` distro (ROS is sourced by the login shell via the
+helper setup):
 
-Opens separate PowerShell windows that stream topic output from the running container:
+```bash
+rostopic list
+rosservice list
 
-```powershell
-.\watch_gegi_topics.ps1
+rostopic echo /compton_event
+rostopic echo /spectrum
+rostopic echo /source_direction
+
+rostopic hz /compton_event /energy_deposit    # is the detector streaming?
 ```
 
-Parameters:
+The `watch_gegi_topics.ps1` helper (Windows side) can open separate windows that
+stream topic output; it auto-detects the running environment.
 
-- `-ContainerName <name>`: Specify container explicitly (auto-detects by default).
-- `-Mode echo|hz`: Use `echo` for message content or `hz` for publish rate.
-- `-SampleCount N`: Limit to N messages then stop (echo mode only).
+## Plotting Tools (run on Windows)
 
-### Manual topic inspection
-
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rostopic echo /compton_event"
-```
-
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rostopic echo /spectrum"
-```
-
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rostopic echo /source_direction"
-```
-
-### List all active topics / services
-
-```powershell
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; rostopic list"
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; rosservice list"
-```
-
-## Plotting Tools
-
-Live plotting scripts connect to the ROS container via rosbridge websocket:
+Live plotting scripts connect to the driver via the rosbridge websocket on port
+9090. They need `matplotlib` and a websocket client.
 
 | Script | Description |
 |--------|-------------|
-| `tools/plot_live_spectrum.py` | Real-time energy spectrum display |
+| `tools/plot_live_spectrum.py` | Real-time energy spectrum display (`c` clears the display) |
 | `tools/plot_live_heatmap.py` | Live spherical heatmap visualization |
 | `tools/plot_live_2d_heatmap.py` | Live 2D heatmap projection |
 | `tools/plot_spectrum.ps1` | Static spectrum plot from bag/data |
@@ -159,56 +171,104 @@ Live plotting scripts connect to the ROS container via rosbridge websocket:
 
 ## Detector Control via ROS Services
 
-Call services from inside the container:
+From inside the distro:
 
-```powershell
-# Start continuous acquisition
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/start_acquisition"
+```bash
+# Start continuous acquisition (streams/plots only — does NOT save files)
+rosservice call /detector/start_acquisition
 
 # Stop acquisition
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/stop_acquisition"
+rosservice call /detector/stop_acquisition
 
 # Clear accumulated data
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/clear_data"
+rosservice call /detector/clear_data
 
-# Start timed acquisition (e.g. 5 minutes)
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/start_timed_acquisition '{duration_minutes: 5}'"
+# Start a TIMED, RECORDED run (e.g. 5 minutes). Call the RECORDER's service,
+# not the detector's — this one forwards to the detector AND saves
+# .bag/.n42/.csv at the end. The bare /detector/start_timed_acquisition does
+# not save anything.
+rosservice call /data_recorder/start_timed_recording "{duration_minutes: 5}"
+
+# Stop a recorded run early and save what was collected
+rosservice call /data_recorder/stop_recording
 
 # Get detector info (serial, temperature, bias, battery)
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/get_detector_info"
+rosservice call /detector/get_detector_info
 
 # Get run info (timing, count-rate)
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/get_run_info"
+rosservice call /detector/get_run_info
 
 # Toggle bias mode
-docker exec -it gegi_live bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; rosservice call /detector/toggle_bias_mode"
+rosservice call /detector/toggle_bias_mode
 ```
 
+## Unit Tests
+
+The tests need **no detector, no roscore, no hardware**:
+
+```bash
+bash test/run_tests.sh          # -v for verbose
+```
+
+The runner auto-detects the ROS distro, catkin workspace, and Python interpreter.
+Rig-specific values (calibration factors, geometry) are isolated in
+`test/commissioned.py`; the physics tests are parameter-driven. See
+[docs/PORTING.md](docs/PORTING.md) for how the suites map to failures.
+
 ## Troubleshooting
-
-### Command returns no output
-
-- Confirm container is running: `docker ps` and verify `gegi_live` exists.
-- Confirm ROS graph is alive with `rostopic list`.
-- Confirm services are available with `rosservice list`.
 
 ### Topic exists but no messages
 
 - Start acquisition via the `/detector/start_acquisition` service.
-- Verify detector is physically connected and in recording mode.
-- Check container logs for driver errors:
+- Verify the detector is physically connected and in recording mode.
+- Confirm the ROS graph is alive with `rostopic list` and `rosservice list`.
+
+### Empty spectra / heatmaps during acquisition
+
+The detector multiplexes commands and the event stream on one TCP link. Live
+run-info dead-time polling is **disabled by default** in `gegi_full_pipeline.launch`
+for this reason — polling `/detector/get_run_info` mid-run contends with the event
+stream. Authoritative dead-time is fetched once, after the run, by the data recorder.
+
+### Detector unreachable
+
+- Confirm `192.168.50.109:27015` is reachable from the distro (default WSL2 NAT is
+  sufficient — no mirrored networking needed).
+- Only one TCP connection is allowed; make sure nothing else holds it.
+
+## Docker (fallback)
+
+Docker is retained as a fallback only; the WSL2 workflow above is the current
+development path. The `phds_gegi_driver:latest` image and the amd64 Dockerfile in
+`docker/dockerfiles/` still build the workspace.
 
 ```powershell
-docker logs gegi_live --tail 200
+# Build
+docker build -t phds_gegi_driver -f .\docker\dockerfiles\phds_gegi_amd64 .
+
+# Run the full pipeline (rosbridge exposed on 9090)
+docker run --rm -d -p 9090:9090 --name gegi_live phds_gegi_driver bash -lc "source /opt/ros/melodic/setup.bash; source /opt/phds_gegi_driver/devel/setup.bash; roslaunch phds_gegi_driver gegi_full_pipeline.launch"
 ```
 
-## Non-Docker Build (Linux catkin)
+> **Note:** Do not use `--network host` on Docker Desktop for Windows — it does not
+> expose container ports to the host. Use `-p` port mappings instead.
 
-1. Create or use an existing catkin workspace.
-2. Put this repository under `<catkin_ws>/src`.
-3. Install dependencies (`setup/phds_gegi_driver/setup_dependencies.sh`).
-4. Build with `catkin_make`.
-5. Run with `roslaunch phds_gegi_driver gegi_driver.launch`.
+## Cloning to Another Machine
+
+A fresh clone builds with **standard catkin** — it does not need the WSL helper
+scripts. See **[docs/PORTING.md](docs/PORTING.md)**, and read §1 first: the
+calibration in `config/isotopes.yaml` is **detector-specific** and must be re-derived
+for a different GeGI unit or a changed rig.
+
+```bash
+mkdir -p ~/catkin_ws/src && cd ~/catkin_ws/src
+git clone <repo-url> phds_gegi_driver
+cd ~/catkin_ws
+rosdep install --from-paths src --ignore-src -r -y
+catkin_make
+source devel/setup.bash
+roslaunch phds_gegi_driver gegi_full_pipeline.launch
+```
 
 ## License
 

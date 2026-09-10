@@ -13,6 +13,11 @@
     <!-- Ghost rejection by event support (raise to reject more ghosts). -->
     <arg name="support_ratio" default="0.8"/>
     <arg name="min_source_events" default="15"/>
+    <!-- Position-aware activity correction from the imaged hotspot position
+         (see activity.launch; default ON - validated 2026-09-03, position RSD
+         0.65% over centre + 4 corners). MUST be forwarded here or a command-
+         line position_correction:=... is silently ignored by the include. -->
+    <arg name="position_correction" default="true"/>
 
     <!-- GeGI control driver -->
     <include file="$(find phds_gegi_driver)/launch/gegi_driver.launch">
@@ -55,7 +60,9 @@
     </include>
 
     <!-- Activity computation (net peak area and Bq per isotope) -->
-    <include file="$(find phds_gegi_driver)/launch/activity.launch"/>
+    <include file="$(find phds_gegi_driver)/launch/activity.launch">
+        <arg name="position_correction" value="$(arg position_correction)"/>
+    </include>
 
     <!-- Data recorder (saves .bag, .n42, .csv at end of timed acquisition) -->
     <include file="$(find phds_gegi_driver)/launch/data_recorder.launch">

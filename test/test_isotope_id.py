@@ -427,6 +427,18 @@ class TestHeatmapBands(unittest.TestCase):
         bands = hm.identified_bands(['Cs-137', 'Co-60'], self.LIB)
         self.assertEqual(bands['Cs-137'], hm.ISOTOPE_PEAKS['Cs-137'])
 
+    def test_co60_keeps_the_wide_band_even_with_cs137_present(self):
+        """REGRESSION GUARD for a reverted change (2026-09-03): narrowing the
+        Co-60 band to the 1332 photopeak in mixed Cs+Co fields starved the
+        imaging statistics (~10x fewer events) and WORSENED the hotspot bias;
+        the suspected Cs+Cs sum-line contamination was measured to not exist
+        (Cs-only run: ~zero counts at 1324 keV). Imaging wants events - the
+        wide band stays, mixed field or not."""
+        import spherical_heatmap_node as hm
+        for names in (['Co-60'], ['Cs-137', 'Co-60']):
+            bands = hm.identified_bands(names, self.LIB)
+            self.assertEqual(bands['Co-60'], hm.ISOTOPE_PEAKS['Co-60'])
+
     def test_unknown_name_ignored(self):
         import spherical_heatmap_node as hm
         bands = hm.identified_bands(['Xx-999'], self.LIB)

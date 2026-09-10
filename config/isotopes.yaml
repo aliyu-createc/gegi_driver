@@ -88,13 +88,19 @@ isotopes:
     peak_roi_keV: [655.0, 669.0]
     left_sideband_keV: [620.0, 645.0]
     right_sideband_keV: [680.0, 705.0]
-    # Empirical calibration factor (Bq/cps), RECALIBRATED 2026-08-07 in the
-    # operational geometry (580 mm, plywood table + permanent 5 mm plate in place,
-    # background-subtracted -> calibrate-in-place). Cs-137 BH-4106 2.88 MBq
-    # (decay-corrected 2.868), run 20260807_160601: net 34.585 cps
-    # (ambient-subtracted), dead-time x1.008. Was 45672 (0.5 m unshielded).
+    # Empirical calibration factor (Bq/cps), RECALIBRATED 2026-09-04 from the
+    # CLEAN-PIPELINE run 20260904_084851 (580 mm calibrate-in-place, full
+    # detector clear at run start - the retention fix). Cs-137 BH-4106
+    # 2.88 MBq decay-corrected to 2.86279 MBq at 2026-09-04:
+    # CF = 2862790 / (36.2938 cps * 1.00639 dt) = 78377.
+    # Supersedes 75819 (2026-08-27): the GeGI re-streams ~3-5% of retained
+    # spectral content unless fully cleared ('x') before each run; the
+    # Aug-26 calibration run carried that contamination, inflating its net
+    # cps and deflating the CF ~3.4% - clean runs then read ~-3% low
+    # (confirmed 2026-09-04: bag event-rate profile flat from run start,
+    # so the deficit was real, not a post-clear streaming ramp).
     # A = CF * net_cps * dt_factor at the calibration geometry.
-    calibration_factor: 82258.0
+    calibration_factor: 78377.0
     # OPTIONAL manual override: absolute full-energy-peak efficiency at the
     # measurement geometry. LEAVE 0.0 to use the calibration_factor-derived,
     # geometry-independent path above (this is the intended mode). A value > 0
@@ -103,8 +109,19 @@ isotopes:
     efficiency: 0.0
     # Linear attenuation coefficient (1/m) of the shielding-plate material at
     # 662 keV. transmission = exp(-mu_shield_per_m * n_plates * plate_thickness_m).
-    # Steel at 662 keV: mu/rho ~0.0729 cm2/g * 7.87 g/cm3 = 0.574/cm = 57.4/m.
-    mu_shield_per_m: 57.4
+    # EFFECTIVE (broad-beam) value RE-MEASURED 2026-09-04 on the CLEAN
+    # pipeline (full clear per run), Exp F Cs137 runs 20260904_084851/
+    # 090232/090917 (0/1/2 extra plates, geometry-corrected net rates,
+    # log-linear fit, per-point residuals <1%): 48.6 +- ~2.5 /m.
+    # Supersedes 51.4 (2026-09-03: sequence contaminated by detector
+    # retention re-streaming). Build-up in this close geometry makes the
+    # effective mu ~15% below the narrow-beam 57.4/m
+    # (mu/rho 0.0729 cm2/g * 7.87 g/cm3).
+    mu_shield_per_m: 48.6
+    # Measured broad-beam transmissions per EXTRA-plate count (clean runs
+    # 20260904_084851/090232/090917, geometry-corrected). Exact values used
+    # for 1-2 plates; >2 extrapolates from T(2) with mu_shield_per_m.
+    plate_transmission: {1: 0.7915, 2: 0.6125}
 
   Co60_1173:
     energy_keV: 1173.2
@@ -112,15 +129,30 @@ isotopes:
     peak_roi_keV: [1165.0, 1181.0]
     left_sideband_keV: [1140.0, 1158.0]
     right_sideband_keV: [1190.0, 1208.0]
-    # RECALIBRATED 2026-08-07 in the operational geometry (580 mm, in-place,
-    # background-subtracted). Co-60 BH-4103 1.130 MBq (decay-corrected 1.103),
-    # run 20260807_115314: net 6.750 cps (ambient-subtracted). Was 107490 (0.5 m).
-    calibration_factor: 163431.0
+    # RECALIBRATED 2026-08-27 from Experiment B run 20260826_162407 (corrected
+    # pipeline - see the Cs137 CF note). Co-60 BH-4103 1.13 MBq decay-corrected
+    # to 1.09555 MBq at 2026-08-26. Supersedes 163431 (2026-08-07, live-time-
+    # inflated ~7%).
+    calibration_factor: 152660.0
     # OPTIONAL manual override (see Cs137 note): leave 0.0 to derive efficiency
     # from calibration_factor. Only used if calibration_factor is absent.
     efficiency: 0.0
-    # Steel at 1173 keV: mu/rho ~0.0531 cm2/g * 7.87 = 0.418/cm = 41.8/m.
-    mu_shield_per_m: 41.8
+    # Steel at 1173 keV: mu/rho ~0.0531 cm2/g * 7.87 = 0.418/cm = 41.8/m
+    # (narrow-beam). The MEASURED broad-beam behaviour (clean source-
+    # untouched triplet 20260904_163328/164306/164946) is NOT a single
+    # exponential: plate 1 transmits at ~narrow-beam (T=0.814,
+    # mu_eff 41.1) while plate 2 adds build-up (cumulative T=0.718,
+    # mu_eff 33.2) - hence the measured table below rules for 1-2 plates
+    # and this mu is only the >2-plate extrapolation slope. The per-line LSQ
+    # slopes (34.8 here, 36.2 at 1332) invert the physical energy ordering
+    # within their ~1-sigma noise, so both Co lines carry the pooled value
+    # (35.5/35.0, ordering preserved).
+    mu_shield_per_m: 35.5
+    # T(1) = mean of TWO independent source-untouched pair measurements
+    # (0.8141 triplet 16:33-16:49; 0.8562 pair 17:48-17:55, both 2026-09-04;
+    # they differ 5.2% = ~1.6 sigma counting - single-pair T carries ~+-3%).
+    # T(2) from the triplet's direct 2-plate/anchor ratio.
+    plate_transmission: {1: 0.835, 2: 0.7178}
 
   Co60_1332:
     energy_keV: 1332.5
@@ -134,15 +166,23 @@ isotopes:
     # continuum is linear so the net area (and the CF) are unchanged.
     left_sideband_keV: [1304.0, 1322.0]
     right_sideband_keV: [1348.0, 1366.0]
-    # RECALIBRATED 2026-08-07 in the operational geometry (580 mm, in-place,
-    # background-subtracted). Co-60 1.103 MBq, run 20260807_115314: net 4.823 cps
-    # (ambient-subtracted). The 1332/1173 CF ratio 1.40 = the measured
-    # photopeak-efficiency ratio. Was 152010 (0.5 m).
-    calibration_factor: 228724.0
+    # RECALIBRATED 2026-08-27 from Experiment B run 20260826_162407 (corrected
+    # pipeline - see the Cs137 CF note). Co-60 1.09555 MBq at 2026-08-26.
+    # Supersedes 228724 (2026-08-07, live-time-inflated ~5%). The 1332/1173
+    # CF ratio 1.42 = the measured photopeak-efficiency ratio.
+    calibration_factor: 216707.0
     # OPTIONAL manual override (see Cs137 note): leave 0.0 to derive efficiency
     # from calibration_factor. Only used if calibration_factor is absent.
     efficiency: 0.0
-    # Steel at 1332 keV: mu/rho ~0.0503 cm2/g * 7.87 = 0.396/cm = 39.6/m.
-    mu_shield_per_m: 39.6
+    # Steel at 1332 keV: mu/rho ~0.0503 cm2/g * 7.87 = 0.396/cm = 39.6/m
+    # (narrow-beam). Measured broad-beam table (clean triplet, see the
+    # Co60_1173 note): plate 1 ~narrow-beam (T=0.818, mu_eff 40.1),
+    # plate 2 adds build-up (cumulative T=0.703, mu_eff 35.3). Table rules
+    # for 1-2 plates; this mu only extrapolates beyond (pooled Co slope,
+    # see the Co60_1173 note).
+    mu_shield_per_m: 35.0
+    # T(1) = mean of the two source-untouched determinations (0.8183, 0.8308
+    # - see the Co60_1173 note); T(2) from the triplet.
+    plate_transmission: {1: 0.825, 2: 0.7028}
 
 

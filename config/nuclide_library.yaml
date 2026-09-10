@@ -25,12 +25,15 @@
 # Add a nuclide by appending an entry - nothing else needs to change.
 
 # Detector energy resolution model: FWHM(E) = sqrt(a*E + b)  [keV], E in keV.
-# Defaults approximate a planar HPGe (~1.6 keV at 662, ~2.2 keV at 1332).
-# VALIDATE against real peaks (tools/identify_isotopes.py --fit-fwhm prints
-# measured widths of strong peaks) and update a/b if they disagree.
+# MEASURED 2026-09-03 from the calibration run 20260826_134921 (15k channels,
+# tools/identify_isotopes.py --fit-fwhm): least-squares of FWHM^2 = a*E + b on
+# the clean strong lines 122/245/345/662/1174/1334 keV -> ~2.9 keV at 662,
+# ~3.9 keV at 1332 (includes 0.2 keV binning). Supersedes the estimated
+# a=0.0034/b=0.31 (~2x too narrow - model FWHM 1.6 keV at 662 vs measured
+# 2.87). Re-fit after any detector recalibration.
 resolution:
-  a: 0.0034
-  b: 0.31
+  a: 0.0104
+  b: 1.57
 
 # Permanent in-beam shielding, used ONLY to weight line detectability during
 # matching (transmission = exp(-mu/rho * rho * t) with the iron mu/rho table
