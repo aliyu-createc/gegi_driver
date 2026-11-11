@@ -5,7 +5,9 @@
 #include <phds_gegi_driver/phds_gegi_driver.hpp>
 
 #include <cmath>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 
 namespace { // Anon
     template<typename T>
@@ -31,12 +33,16 @@ namespace phds_gegi_driver {
         std::string event_topic = "/compton_event";
         std::string energy_topic = "/energy_deposit";
         std::string singles_energy_topic = "/energy_deposit_singles";
+        std::string health_topic = "/gegi/health";
+        double health_period_sec = 1.0;
 
         getParam(pn, "gegi_ip", gegi_ip);
         getParam(pn, "gegi_port", gegi_port);
         getParam(pn, "event_topic", event_topic);
         getParam(pn, "energy_topic", energy_topic);
         getParam(pn, "singles_energy_topic", singles_energy_topic);
+        getParam(pn, "health_topic", health_topic);
+        getParam(pn, "health_period_sec", health_period_sec);
         getParam(pn, "detector_frame", detector_frame_);
         getParam(pn, "detector_info_cache_max_age_sec", detector_info_cache_max_age_sec_);
 
@@ -62,13 +68,24 @@ namespace phds_gegi_driver {
         energy_publisher_ = n.advertise<std_msgs::Float64>(energy_topic, OUTPUT_BUFFER_SIZE);
         singles_energy_publisher_ = n.advertise<std_msgs::Float64>(singles_energy_topic, OUTPUT_BUFFER_SIZE);
 
+        // Latched so a late subscriber (e.g. PRISM attaching after launch)
+        // immediately receives the most recent health sample.
+        health_publisher_ = n.advertise<std_msgs::String>(health_topic, 2, true);
+
+        // Initial connection failure is no longer fatal: the reader's monitor
+        // thread keeps retrying with bounded backoff, and the health heartbeat
+        // reports connected=false in the meantime. Services stay available (they
+        // return failure while disconnected).
         try {
             tcp_event_reader_.connect(gegi_ip, gegi_port);
-            tcp_event_reader_.startListening();
         } catch (std::exception &error) {
-            ROS_ERROR_STREAM("PhdsGegiDriver: Could not start TCP IP socket: " << error.what());
-            exit(1);
+            ROS_ERROR_STREAM("PhdsGegiDriver: initial GeGI connection failed ("
+                             << error.what() << ") - retrying in background");
         }
+        tcp_event_reader_.startListening();
+
+        health_timer_ = n.createTimer(ros::Duration(health_period_sec),
+                                      &PhdsGegiDriver::publishHealth, this);
 
         // Advertise remote control services
         start_acq_service_ = n.advertiseService("detector/start_acquisition",
@@ -141,6 +158,40 @@ namespace phds_gegi_driver {
         std_msgs::Float64 msg;
         msg.data = energy_kev;
         singles_energy_publisher_.publish(msg);
+    }
+
+    void PhdsGegiDriver::publishHealth(const ros::TimerEvent &) {
+        const ros::Time now = ros::Time::now();
+        const std::uint64_t events_total = tcp_event_reader_.eventsTotal();
+
+        double event_rate_hz = 0.0;
+        if (!last_health_stamp_.isZero()) {
+            const double dt = (now - last_health_stamp_).toSec();
+            if (dt > 0.0) {
+                event_rate_hz =
+                        static_cast<double>(events_total - last_health_events_total_) / dt;
+            }
+        }
+        last_health_stamp_ = now;
+        last_health_events_total_ = events_total;
+
+        const double last_event_age = tcp_event_reader_.secondsSinceLastEvent();
+
+        std::ostringstream json;
+        json.setf(std::ios::fixed);
+        json << "{"
+             << "\"schema_version\":1,"
+             << "\"stamp\":" << std::setprecision(3) << now.toSec() << ","
+             << "\"connected\":" << (tcp_event_reader_.isConnected() ? "true" : "false") << ","
+             << "\"events_total\":" << events_total << ","
+             << "\"event_rate_hz\":" << std::setprecision(2) << event_rate_hz << ","
+             << "\"last_event_age_sec\":" << std::setprecision(2) << last_event_age << ","
+             << "\"reconnect_count\":" << tcp_event_reader_.reconnectCount()
+             << "}";
+
+        std_msgs::String msg;
+        msg.data = json.str();
+        health_publisher_.publish(msg);
     }
 
     bool PhdsGegiDriver::handleStartAcquisition(phds_gegi_driver::StartAcquisition::Request &req,

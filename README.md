@@ -21,6 +21,10 @@ This project provides:
 
 - `/compton_event` (`radiation_detector_msgs/ComptonEvent`): Raw Compton event stream from the detector.
 - `/energy_deposit` (`std_msgs/Float64`): Per-interaction energy in keV.
+- `/gegi/health` (`std_msgs/String`): 1 Hz latched JSON heartbeat — connection
+  state, event counters/rate, reconnect count. The driver auto-reconnects to the
+  detector with bounded backoff; use this topic (not mid-run run-info polling)
+  for supervision. See [docs/DRIVER_INTERFACE.md](docs/DRIVER_INTERFACE.md) §3.
 
 **Spectrum node** (`spectrum_node.py`):
 

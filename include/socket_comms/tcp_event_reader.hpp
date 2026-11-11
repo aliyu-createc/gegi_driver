@@ -52,6 +52,16 @@ namespace phds_gegi_driver::socket_comms {
         void connect(const std::string &ip, const std::string &port);
         void startListening();
 
+        // --- Health / connection state (lock-free; safe from any thread) ---
+        // The monitor thread auto-reconnects with bounded exponential backoff
+        // whenever the detector link drops (or never came up); these expose the
+        // state so the driver node can publish a heartbeat for supervisors.
+        bool isConnected() const { return connected_.load(); }
+        std::uint64_t eventsTotal() const { return events_total_.load(); }
+        std::uint32_t reconnectCount() const { return reconnect_count_.load(); }
+        // Seconds since the last parsed event packet, or -1 if none seen yet.
+        double secondsSinceLastEvent() const;
+
         // Energy-scale correction applied to every parsed site energy:
         //   E_true = c0 + c1*E + c2*E^2   (default identity).
         // The detector's onboard event-energy calibration reads slightly high
@@ -80,6 +90,10 @@ namespace phds_gegi_driver::socket_comms {
     private:
         void monitorSocket();
         bool sendCommand(char cmd);  // Low-level send
+        // One reconnect attempt to the endpoint saved by connect(). Closes the
+        // stale socket first; returns true on success. Called by the monitor
+        // thread only.
+        bool tryReconnectOnce();
 
         double correctEnergy(double e_kev) const {
             return ecal_c0_ + ecal_c1_ * e_kev + ecal_c2_ * e_kev * e_kev;
@@ -105,6 +119,17 @@ namespace phds_gegi_driver::socket_comms {
         std::mutex response_mutex_;   // Held during command response reads; monitorSocket waits on this
 
         std::atomic<bool> running_ {false};
+
+        // Endpoint saved by connect() so the monitor thread can reconnect.
+        std::string ip_;
+        std::string port_;
+
+        // Health / connection state (see accessors above).
+        std::atomic<bool> connected_ {false};
+        std::atomic<std::uint64_t> events_total_ {0};
+        std::atomic<std::uint32_t> reconnect_count_ {0};
+        // steady_clock ms of the last parsed event packet; -1 = never.
+        std::atomic<std::int64_t> last_event_steady_ms_ {-1};
 
         // Latest run-info frame, parsed INLINE by the monitor thread (the sole
         // socket reader) as frames stream past in reply to 'i'. getRunInfo()

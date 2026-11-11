@@ -12,11 +12,16 @@
     <arg name="energy_cal_c1" default="0.9994308"/>
     <arg name="energy_cal_c2" default="0.0"/>
 
-    <node name="driver" pkg="phds_gegi_driver" type="phds_gegi_driver_node" output="screen">
+    <!-- respawn: last line of defence if the node process dies (TCP drops are
+         handled in-process by the reader's auto-reconnect). -->
+    <node name="driver" pkg="phds_gegi_driver" type="phds_gegi_driver_node" output="screen"
+          respawn="true" respawn_delay="5">
         <param name="gegi_ip" value="$(arg gegi_ip)" />
         <param name="gegi_port" type="string" value="$(arg gegi_port)" />
         <param name="event_topic" value="/compton_event" />
         <param name="energy_topic" value="/energy_deposit" />
+        <param name="health_topic" value="/gegi/health" />
+        <param name="health_period_sec" type="double" value="1.0" />
         <param name="detector_frame" value="detector" />
         <param name="energy_cal_c0" type="double" value="$(arg energy_cal_c0)" />
         <param name="energy_cal_c1" type="double" value="$(arg energy_cal_c1)" />

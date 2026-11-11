@@ -44,6 +44,7 @@ There are **two messaging layers**:
 | `/compton_event` | `radiation_detector_msgs/ComptonEvent` | out | one msg per 2-site Compton event (imaging input) |
 | `/energy_deposit` | `std_msgs/Float64` | out | per-event energy (keV); 1-site + 2-site-summed → spectrum |
 | `/energy_deposit_singles` | `std_msgs/Float64` | out | per-event energy (keV), 1-site only |
+| `/gegi/health` | `std_msgs/String` | out | **JSON** heartbeat, 1 Hz, latched (see below) |
 | `/spectrum` | `radiation_detector_msgs/Spectrum` | out | histogram, republished ~4 Hz |
 | `/activity/results` | `std_msgs/String` | out | **JSON** activity report (see §5) |
 | `/activity/total_activity` | `std_msgs/Float64` | out | summed activity (MBq) |
@@ -58,6 +59,32 @@ There are **two messaging layers**:
 Note on rates: `/compton_event` and `/energy_deposit` fire once **per detector
 event** and can burst to thousands/sec. Publisher and subscriber queues are sized
 at 10,000 so bursts are not dropped.
+
+**`/gegi/health` (JSON in `std_msgs/String`, 1 Hz, latched)** — the supervision
+feed. Published by the C++ driver from state it already holds, so reading it
+never contends with the event stream (unlike polling `/detector/get_run_info`
+mid-run). Fields:
+
+```json
+{
+  "schema_version": 1,
+  "stamp": 1767103200.123,
+  "connected": true,
+  "events_total": 184223,
+  "event_rate_hz": 851.20,
+  "last_event_age_sec": 0.01,
+  "reconnect_count": 0
+}
+```
+
+- `connected` — TCP link to the detector is up. The driver **auto-reconnects
+  with bounded exponential backoff** (1 s doubling to 30 s) if the link drops or
+  was never established at startup; `reconnect_count` increments on each
+  successful (re)connection after a failure.
+- `last_event_age_sec` — seconds since the last parsed event packet (`-1` if
+  none yet). A supervisor's staleness check: `connected && acquiring` but a
+  large age means the stream has stalled.
+- `schema_version` — bump on any breaking change to this JSON layout.
 
 ## 4. Services (the control surface)
 Detector control (provided by the C++ node, under `/detector/`):
@@ -126,7 +153,8 @@ string message
 ```
 
 **`/activity/results` (JSON in `std_msgs/String`)** — top-level object with a
-`timestamp`, `total_activity_MBq`, and an `isotopes` array; each element carries
+`schema_version` (currently `1`; bump on breaking layout changes), `timestamp`,
+`total_activity_MBq`, and an `isotopes` array; each element carries
 `isotope`, `energy_keV`, `activity_MBq`, `sigma_activity_MBq`, `valid`,
 `net_corrected`, `source_distance_m`, `total_shield_plates`, `shield_transmission`,
 `method`, etc. This is the easiest single feed for PRISM to consume — parse the
@@ -157,6 +185,15 @@ and use rosbridge for the digested feeds (`/activity/results`, `/spectrum`,
 ## 8. Practical notes for the integrator
 - The detector allows **one TCP connection**; the C++ node owns it. Do not open a
   second connection to the detector — go through the ROS interface.
+- **Supervise via `/gegi/health`**, not by polling `/detector/get_run_info` during
+  acquisition (the detector multiplexes commands and the event stream on one TCP
+  link, so mid-run polling contends with the stream).
+- The driver is self-healing: in-process TCP auto-reconnect with backoff, plus
+  `respawn="true"` on the node as a last line of defence. A detector power-cycle
+  therefore does not require restarting the pipeline — watch `connected` /
+  `reconnect_count` in `/gegi/health`. Note the detector does **not** resume
+  acquisition by itself after a drop; re-issue start if `last_event_age_sec`
+  stays high while `connected` is true.
 - `/activity/results` and `/source_isotopes` are the highest-value digested feeds
   for a supervisory system; raw `/compton_event` is only needed for custom
   imaging.

@@ -10,6 +10,7 @@
 
 #include <radiation_detector_msgs/ComptonEvent.h>
 #include <std_msgs/Float64.h>
+#include <std_msgs/String.h>
 #include <phds_gegi_driver/StartAcquisition.h>
 #include <phds_gegi_driver/StopAcquisition.h>
 #include <phds_gegi_driver/ClearData.h>
@@ -21,6 +22,7 @@
 #include <ros/ros.h>
 
 #include <cstdlib> // exit
+#include <cstdint> // uint64_t
 #include <functional> // bind
 #include <mutex> // mutex
 #include <string> // string
@@ -38,6 +40,11 @@ namespace phds_gegi_driver {
         void publishEnergy(double energy_kev);
 
         void publishSinglesEnergy(double energy_kev);
+
+        // Periodic JSON heartbeat on the health topic (see DRIVER_INTERFACE.md)
+        // so a supervisor (e.g. PRISM) can monitor the detector link without
+        // polling /detector/get_run_info, which contends with the event stream.
+        void publishHealth(const ros::TimerEvent &event);
 
         // Remote control service callbacks
         bool handleStartAcquisition(phds_gegi_driver::StartAcquisition::Request &req,
@@ -67,6 +74,12 @@ namespace phds_gegi_driver {
         ros::Publisher event_publisher_;
         ros::Publisher energy_publisher_;
         ros::Publisher singles_energy_publisher_;
+
+        // Health heartbeat
+        ros::Publisher health_publisher_;
+        ros::Timer health_timer_;
+        std::uint64_t last_health_events_total_ = 0;
+        ros::Time last_health_stamp_;
 
         // Remote control service servers
         ros::ServiceServer start_acq_service_;

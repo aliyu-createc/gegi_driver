@@ -744,6 +744,7 @@ class ActivityNode(object):
             results_MBq.append(r_copy)
 
         report = {
+            'schema_version': 1,
             'timestamp': rospy.Time.now().to_sec(),
             'real_time_s': real_time_s,
             'live_time_s': live_time_s,

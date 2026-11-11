@@ -192,6 +192,11 @@ namespace phds_gegi_driver::socket_comms {
     void TcpEventReader::connect(const std::string &ip, const std::string &port) {
         using namespace boost::asio::ip;
 
+        // Save the endpoint first so the monitor thread can reconnect even if
+        // this initial attempt fails.
+        ip_ = ip;
+        port_ = port;
+
         std::cout << "Connecting to GeGI at " + ip + ":" + port << "..." << std::endl;
 
         tcp::resolver resolver(io_service_);
@@ -217,7 +222,41 @@ namespace phds_gegi_driver::socket_comms {
         // socket_mutex_/response_mutex_. (command_socket_ stays closed; all
         // command/run-info paths fall back to socket_ when it is not open.)
 
+        connected_.store(true);
         std::cout << "Connected to GeGI at " + ip + ":" + port << std::endl;
+    }
+
+    bool TcpEventReader::tryReconnectOnce() {
+        using namespace boost::asio::ip;
+
+        if (ip_.empty()) {
+            return false;  // connect() never called; nothing to reconnect to
+        }
+
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        boost::system::error_code ignored_error;
+        socket_.close(ignored_error);
+
+        try {
+            tcp::resolver resolver(io_service_);
+            tcp::resolver::query query(ip_, port_);
+            boost::asio::connect(socket_, resolver.resolve(query));
+            return true;
+        } catch (const std::exception &ex) {
+            std::cerr << "GeGI reconnect attempt failed: " << ex.what() << std::endl;
+            socket_.close(ignored_error);
+            return false;
+        }
+    }
+
+    double TcpEventReader::secondsSinceLastEvent() const {
+        const std::int64_t last_ms = last_event_steady_ms_.load();
+        if (last_ms < 0) {
+            return -1.0;
+        }
+        const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        return static_cast<double>(now_ms - last_ms) / 1000.0;
     }
 
     void TcpEventReader::startListening() {
@@ -296,7 +335,48 @@ namespace phds_gegi_driver::socket_comms {
             return true;
         };
 
+        // Reconnect backoff state (doubles on failure, resets on success).
+        constexpr int RECONNECT_DELAY_INITIAL_MS = 1000;
+        constexpr int RECONNECT_DELAY_MAX_MS = 30000;
+        int reconnect_delay_ms = RECONNECT_DELAY_INITIAL_MS;
+
+        // Mark the link lost and discard any partial packet bytes; the next
+        // loop iteration enters the reconnect path.
+        auto handle_connection_loss = [&](const std::string &why) {
+            std::cerr << "GeGI connection lost (" << why
+                      << ") - will attempt to reconnect" << std::endl;
+            connected_.store(false);
+            stream_buffer.clear();
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            boost::system::error_code ignored_error;
+            socket_.close(ignored_error);
+        };
+
         while (running_.load()) {
+            // ---- Reconnect path: no link (initial connect failed or dropped) ----
+            if (!connected_.load()) {
+                // Interruptible backoff wait.
+                for (int waited_ms = 0;
+                     waited_ms < reconnect_delay_ms && running_.load();
+                     waited_ms += 100) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (!running_.load()) break;
+
+                if (tryReconnectOnce()) {
+                    connected_.store(true);
+                    reconnect_count_.fetch_add(1);
+                    reconnect_delay_ms = RECONNECT_DELAY_INITIAL_MS;
+                    std::cout << "Reconnected to GeGI at " << ip_ << ":" << port_
+                              << " (reconnect #" << reconnect_count_.load() << ")"
+                              << std::endl;
+                } else {
+                    reconnect_delay_ms = std::min(reconnect_delay_ms * 2,
+                                                  RECONNECT_DELAY_MAX_MS);
+                }
+                continue;
+            }
+
             std::array<char, 1024> data_in{};
             boost::system::error_code error;
             size_t bytes_read = 0;
@@ -310,9 +390,8 @@ namespace phds_gegi_driver::socket_comms {
 
                 const size_t available = socket_.available(error);
                 if (error) {
-                    std::cerr << "Socket available() failed: " << error.message() << std::endl;
-                    running_.store(false);
-                    return;
+                    handle_connection_loss("available() failed: " + error.message());
+                    continue;
                 }
                 if (available == 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -324,9 +403,8 @@ namespace phds_gegi_driver::socket_comms {
             }
 
             if (error == boost::asio::error::eof) {
-                std::cerr << "Connection lost" << std::endl;
-                running_.store(false);
-                return;
+                handle_connection_loss("EOF");
+                continue;
             } else if (error) {
                 std::cerr << "Error reading from socket: " << error.message() << std::endl;
                 continue;
@@ -475,6 +553,12 @@ namespace phds_gegi_driver::socket_comms {
                     }
                 }
 
+                // Health bookkeeping: one event packet fully parsed.
+                events_total_.fetch_add(1);
+                last_event_steady_ms_.store(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+
                 // Consume the packet from the buffer
                 stream_buffer.erase(stream_buffer.begin(), stream_buffer.begin() + static_cast<long long>(pkt_size));
             }
@@ -483,6 +567,7 @@ namespace phds_gegi_driver::socket_comms {
 
     void TcpEventReader::stopListening() {
         running_.store(false);
+        connected_.store(false);
 
         if (monitoring_thread_.joinable()) {
             // Closing the socket unblocks the listener thread's blocking read.
