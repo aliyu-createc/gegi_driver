@@ -85,7 +85,7 @@ the custom `ComptonEvent` / `Spectrum` messages build automatically.
 
 | Setting | Where | Note |
 |---|---|---|
-| `gegi_ip` (default `192.168.50.109`) | `launch/gegi_driver.launch`, `launch/gegi_full_pipeline.launch` | your network |
+| `gegi_ip` (default `172.31.1.40`) | `launch/gegi_driver.launch`, `launch/gegi_full_pipeline.launch` | your network |
 | `gegi_port` (default `27015`) | same | rarely changes |
 | `output_dir` (default `/opt/phds_gegi_driver/data`) | `launch/gegi_full_pipeline.launch`, `launch/data_recorder.launch` | must exist and be writable |
 | Calibration + geometry | `config/isotopes.yaml`, `test/commissioned.py` | **see §1** |

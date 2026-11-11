@@ -70,7 +70,7 @@ All detector control services are under `/detector/*`:
 ### Hardware / Detector
 
 - Detector powered and cooled (according to PHDS operating guidance).
-- Detector network reachable from the host running the driver (default `192.168.50.109:27015`).
+- Detector network reachable from the host running the driver (default `172.31.1.40:27015`).
 - Detector acquisition application on the tablet in the correct recording state.
 - The detector accepts **one TCP connection**, owned by the C++ driver node. Do not open a second connection.
 
@@ -236,7 +236,7 @@ stream. Authoritative dead-time is fetched once, after the run, by the data reco
 
 ### Detector unreachable
 
-- Confirm `192.168.50.109:27015` is reachable from the distro (default WSL2 NAT is
+- Confirm `172.31.1.40:27015` is reachable from the distro (default WSL2 NAT is
   sufficient — no mirrored networking needed).
 - Only one TCP connection is allowed; make sure nothing else holds it.
 

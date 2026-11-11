@@ -9,11 +9,11 @@ There are **two messaging layers**:
 
 ```
  GeGI detector  <--(A) raw TCP binary-->  C++ driver node  <--(B) ROS 1 pub/sub + services-->  consumers / PRISM
- 192.168.50.109:27015                     phds_gegi_driver                                       (native ROS or rosbridge)
+ 172.31.1.40:27015                         phds_gegi_driver                                       (native ROS or rosbridge)
 ```
 
 - **(A) Detector ↔ driver — raw TCP, binary GeGI protocol.** A single TCP socket
-  to the detector (default `192.168.50.109:27015`). Variable-length event packets
+  to the detector (default `172.31.1.40:27015`). Variable-length event packets
   stream in; single-byte commands go out (`g`=start, `s`=stop, `c`=clear,
   `i`=run-info, `d`=detector-info, `1`–`8`=timed presets, …). This is internal to
   the C++ node — **PRISM does not touch this layer.**

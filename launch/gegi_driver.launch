@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <launch>
-    <arg name="gegi_ip" default="192.168.50.109"/>
+    <arg name="gegi_ip" default="172.31.1.40"/>
     <arg name="gegi_port" default="27015"/>
     <!-- Energy-scale correction E_true = c0 + c1*E + c2*E^2, applied to every
          parsed site energy in the C++ driver. The detector's onboard event
